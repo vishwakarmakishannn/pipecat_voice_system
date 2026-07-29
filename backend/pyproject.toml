@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-rag-backend"
+version = "0.1.0"
+description = "Pipecat RAG Voice Agent Backend"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pipecat-ai[cartesia,daily,deepgram,openai,google,silero,runner,webrtc,piper]>=0.0.44",
+    "fastapi",
+    "uvicorn",
+    "python-dotenv",
+    "loguru",
+    "sqlalchemy",
+    "asyncpg",
+    "alembic",
+    "pgvector",
+    "docling",
+    "aioboto3",
+    "aiofiles",
+    "pyjwt",
+    "bcrypt",
+    "passlib[bcrypt]",
+    "sentence-transformers",
+    # Direct declarations let uv route transitive ML requirements to CPU-only
+    # wheels; this service does not use CUDA at runtime.
+    "torch",
+    "torchvision",
+    "python-multipart",
+    "crawl4ai",
+    "trafilatura",
+    "tavily-python",
+    "pydantic"
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "api",
+    "core",
+    "providers",
+    "services",
+    "tools"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [
+  "."
+]

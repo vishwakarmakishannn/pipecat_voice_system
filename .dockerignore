@@ -1,0 +1,44 @@
+# Source-control and editor metadata
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets must never enter a Docker build context
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Python dependencies and caches
+**/.venv/
+**/venv/
+**/env/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+
+# JavaScript dependencies and generated output
+**/node_modules/
+**/dist/
+**/.vite/
+**/coverage/
+
+# Runtime and generated data
+**/uploads/
+**/graphify-out/
+**/*.log
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# Local test and temporary artifacts
+**/test-results/
+**/playwright-report/
+**/*.bak

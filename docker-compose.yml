@@ -1,0 +1,82 @@
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: pipecat_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pipecat_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pipecat_password}
+      POSTGRES_DB: ${POSTGRES_DB:-pipecat_db}
+    # Expose port so local 'uv run main.py' can still connect during development!
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-pipecat_user}:${POSTGRES_PASSWORD:-pipecat_password}@db:5432/${POSTGRES_DB:-pipecat_db}
+    env_file:
+      - .env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pipecat_backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # In Docker, we connect to 'db:5432' instead of 'localhost:5434'
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-pipecat_user}:${POSTGRES_PASSWORD:-pipecat_password}@db:5432/${POSTGRES_DB:-pipecat_db}
+    env_file:
+      - .env
+    # Exposing the backend port internally or via reverse proxy
+    ports:
+      - "7860:7860"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health/ready', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_STUN_URLS: ${VITE_STUN_URLS:-stun:stun.l.google.com:19302}
+        VITE_TURN_URLS: ${VITE_TURN_URLS:-}
+        VITE_TURN_USERNAME: ${VITE_TURN_USERNAME:-}
+        VITE_TURN_CREDENTIAL: ${VITE_TURN_CREDENTIAL:-}
+        VITE_API_BASE: ${VITE_API_BASE:-}
+        VITE_AUDIO_ECHO_CANCELLATION: ${VITE_AUDIO_ECHO_CANCELLATION:-true}
+        VITE_AUDIO_NOISE_SUPPRESSION: ${VITE_AUDIO_NOISE_SUPPRESSION:-true}
+        VITE_AUDIO_AUTO_GAIN_CONTROL: ${VITE_AUDIO_AUTO_GAIN_CONTROL:-true}
+        VITE_LOCAL_SPEECH_LEVEL_THRESHOLD: ${VITE_LOCAL_SPEECH_LEVEL_THRESHOLD:-0.01}
+        VITE_WEBRTC_CONNECT_TIMEOUT_MS: ${VITE_WEBRTC_CONNECT_TIMEOUT_MS:-8000}
+        VITE_MAX_TRANSCRIPT_ITEMS: ${VITE_MAX_TRANSCRIPT_ITEMS:-250}
+    container_name: pipecat_frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,15 @@
+fastapi
+loguru
+python-dotenv
+pipecat-ai[cartesia,daily,deepgram,openai,google,silero,runner,webrtc,piper]
+sqlalchemy
+asyncpg
+passlib[bcrypt]
+pyjwt
+pydantic
+pgvector
+python-multipart
+docling
+crawl4ai
+trafilatura
+tavily-python
