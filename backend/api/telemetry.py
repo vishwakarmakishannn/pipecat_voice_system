@@ -19,18 +19,25 @@ class VoiceLatencyTelemetry(BaseModel):
 
     session_id: str | None = Field(default=None, max_length=200)
     turn_id: int = Field(ge=0)
+    latency_stage: Literal["stt", "llm", "tts"] | None = None
+    latency_complete: bool = False
     category: Literal["direct", "rag", "tool"]
     basis: Literal["user_stopped", "final_stt"] | None = None
     with_tools: bool = False
     rag_used: bool = False
     rag_considered: bool = False
     rag_bypassed: bool = False
+    stt_provider: str | None = Field(default=None, max_length=40)
+    stt_model: str | None = Field(default=None, max_length=120)
     llm_provider: str | None = Field(default=None, max_length=40)
     llm_model: str | None = Field(default=None, max_length=120)
     tts_provider: str | None = Field(default=None, max_length=40)
     tts_model: str | None = Field(default=None, max_length=120)
     llm_connection_warmed: bool = False
 
+    stt_latency_ms: float | None = Field(default=None, ge=0, le=300000)
+    llm_latency_ms: float | None = Field(default=None, ge=0, le=300000)
+    tts_latency_ms: float | None = Field(default=None, ge=0, le=300000)
     llm_ms: float | None = Field(default=None, ge=-5000, le=300000)
     speakable_text_ms: float | None = Field(default=None, ge=-5000, le=300000)
     tts_aggregation_ms: float | None = Field(default=None, ge=-5000, le=300000)

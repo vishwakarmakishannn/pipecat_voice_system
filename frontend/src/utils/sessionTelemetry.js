@@ -188,16 +188,59 @@ export async function withConnectionDeadline(connectPromise, timeoutMs, onTimeou
   }
 }
 
-export async function ensureBotAudioPlayback() {
+function audioTrackFrom(element) {
+  return element?.srcObject?.getAudioTracks?.()[0] || null;
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => window.requestAnimationFrame(resolve));
+}
+
+async function waitForAudioTrack(element, expectedTrack, timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  while (expectedTrack?.readyState !== 'ended') {
+    if (audioTrackFrom(element)?.id === expectedTrack?.id) return true;
+    if (performance.now() >= deadline) return false;
+    await nextAnimationFrame();
+  }
+  return false;
+}
+
+export async function ensureBotAudioPlayback(expectedTrack, timeoutMs = 1000) {
   const element = document.querySelector('audio');
   if (!element) return false;
+
+  if (expectedTrack) {
+    const attached = await waitForAudioTrack(element, expectedTrack, timeoutMs);
+    if (!attached) return false;
+  } else if (!audioTrackFrom(element)) {
+    return false;
+  }
+
   element.muted = false;
   element.volume = 1;
-  try {
-    await element.play();
-    return true;
-  } catch (error) {
-    if (!element.srcObject) return false;
-    throw error;
+
+  // React attaches the remote MediaStream in an effect after TrackStarted.
+  // If that source changes while play() is pending, Chromium rejects with an
+  // AbortError. Retry against the same live track; a replaced/ended track is a
+  // stale playback request and should not be reported as an autoplay failure.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await element.play();
+      return true;
+    } catch (error) {
+      if (
+        expectedTrack
+        && (
+          expectedTrack.readyState === 'ended'
+          || audioTrackFrom(element)?.id !== expectedTrack.id
+        )
+      ) {
+        return false;
+      }
+      if (error?.name !== 'AbortError') throw error;
+      await nextAnimationFrame();
+    }
   }
+  return false;
 }

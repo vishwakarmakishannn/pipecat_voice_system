@@ -96,6 +96,13 @@ def _get_groq_client():
     return _groq_client
 
 
+def _get_local_memory_runtime():
+    """Reuse the process-wide llama.cpp client warmed during app startup."""
+    from providers.local.llm.runtime import get_local_llm_runtime
+
+    return get_local_llm_runtime()
+
+
 def is_memory_fact_candidate(text_value: str) -> bool:
     normalized = re.sub(r"\s+", " ", (text_value or "").strip().lower())
     if not normalized or normalized.endswith("?"):
@@ -531,9 +538,23 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
         )
         return response.choices[0].message.content
 
+    async def generate_local() -> str | None:
+        runtime = _get_local_memory_runtime()
+        config = runtime.config
+        response = await runtime.client.chat.completions.create(
+            model=config.model,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+            temperature=0.0,
+            max_tokens=config.max_tokens,
+            extra_body=config.extra_body,
+        )
+        return response.choices[0].message.content
+
     generator = {
         "google": generate_google,
         "groq": generate_groq,
+        "local": generate_local,
         "openai": generate_openai,
     }.get(provider)
     if generator is None:

@@ -43,7 +43,11 @@ def _groq_completion_settings(model: str) -> dict:
         extra.update(
             {
                 "reasoning_effort": effort,
-                "include_reasoning": _env_bool("GROQ_INCLUDE_REASONING", False),
+                "extra_body": {
+                    "include_reasoning": _env_bool(
+                        "GROQ_INCLUDE_REASONING", False
+                    ),
+                },
             }
         )
     return extra

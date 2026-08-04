@@ -16,6 +16,7 @@ def test_provider_aligned_sample_rate_defaults(monkeypatch):
     assert audio_input_sample_rate() == 16000
     assert audio_output_sample_rate("deepgram") == 24000
     assert audio_output_sample_rate("cartesia") == 24000
+    assert audio_output_sample_rate("kokoro") == 24000
     assert audio_output_sample_rate("piper") == 22050
 
 

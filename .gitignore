@@ -36,6 +36,9 @@ dist/
 
 # Uploads
 uploads/
+backend/whisper_models/
+models/
+llama.cpp/
 
 # Database files
 *.db
@@ -44,3 +47,10 @@ uploads/
 
 # Generated outputs
 graphify-out/
+
+llama.cpp/
+models/
+
+google_test.py
+groq_test.py
+stt_test.py

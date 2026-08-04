@@ -715,9 +715,10 @@ def normalize_retrieval_query(query: str) -> str:
 
 
 _QUERY_STOPWORDS = {
-    "a", "an", "and", "are", "according", "article", "document", "documents",
-    "file", "files", "from", "i", "in", "ingested", "is", "it", "link", "my",
-    "of", "on", "please", "saved", "source", "the", "to", "uploaded", "what",
+    "a", "about", "an", "and", "are", "according", "article", "document",
+    "documents", "file", "files", "from", "give", "i", "in", "information",
+    "ingested", "is", "it", "link", "me", "my", "of", "on", "pdf", "pdfs",
+    "please", "saved", "source", "tell", "the", "to", "uploaded", "what",
     "which", "who", "year",
 }
 
@@ -777,13 +778,23 @@ def _vector_similarity(distance: Any) -> float | None:
 
 
 def _is_strong_rag_match(chunk: RetrievedRagChunk) -> bool:
-    if RAG_RERANKER == "lightweight":
-        return chunk.score >= RAG_MIN_FINAL_SCORE
-    if chunk.vector_similarity is not None and chunk.vector_similarity >= RAG_MIN_VECTOR_SIMILARITY:
+    if RAG_RERANKER == "lightweight" and chunk.score >= RAG_MIN_FINAL_SCORE:
+        return True
+    if (
+        chunk.vector_similarity is not None
+        and chunk.vector_similarity >= RAG_MIN_VECTOR_SIMILARITY
+    ):
         return True
     if chunk.text_rank is not None and chunk.text_rank >= RAG_MIN_TEXT_RANK:
         return True
     return False
+
+
+def _text_rank_is_strong(value: Any) -> bool:
+    try:
+        return value is not None and float(value) >= RAG_MIN_TEXT_RANK
+    except (TypeError, ValueError):
+        return False
 
 
 def should_inject_rag_context(
@@ -860,24 +871,45 @@ async def _retrieve_rag_chunks_uncached(
 
     # Lexical retrieval has no embedding dependency. Start it immediately so
     # remote embedding latency and PostgreSQL FTS latency overlap.
-    text_task = asyncio.create_task(_retrieve_text_candidates(user_id, normalized_query))
-    try:
+    text_task = asyncio.create_task(
+        _retrieve_text_candidates(user_id, normalized_query)
+    )
+
+    async def retrieve_vector_candidates():
         if query_embedding is _EMBEDDING_UNSET:
             embedding = await embed_text(normalized_query)
-        elif isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(query_embedding):
+        elif isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(
+            query_embedding
+        ):
             embedding = await query_embedding
         else:
             embedding = query_embedding
-        vector_rows, text_rows = await asyncio.gather(
-            _retrieve_vector_candidates(user_id, embedding)
-            if embedding
-            else asyncio.sleep(0, result=[]),
-            text_task,
+        if not embedding:
+            return []
+        return await _retrieve_vector_candidates(user_id, embedding)
+
+    vector_task = asyncio.create_task(retrieve_vector_candidates())
+    try:
+        text_rows = await text_task
+        strong_text_match = any(
+            _text_rank_is_strong(_rank_value)
+            for _chunk, _rag_file, _rank_value in text_rows
         )
+        if strong_text_match:
+            # An exact lexical hit can release the voice turn immediately.
+            # If this task is awaiting a shared shielded embedding, cancelling
+            # it leaves the underlying shared task available to memory recall.
+            vector_task.cancel()
+            await asyncio.gather(vector_task, return_exceptions=True)
+            vector_rows = []
+        else:
+            vector_rows = await vector_task
     except BaseException:
         if not text_task.done():
             text_task.cancel()
-        await asyncio.gather(text_task, return_exceptions=True)
+        if not vector_task.done():
+            vector_task.cancel()
+        await asyncio.gather(text_task, vector_task, return_exceptions=True)
         raise
     for rank, (chunk, rag_file, _distance) in enumerate(vector_rows, start=1):
         similarity = _vector_similarity(_distance)

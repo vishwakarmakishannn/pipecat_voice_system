@@ -13,6 +13,7 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMTextFrame,
     OutputTransportMessageFrame,
+    OutputTransportMessageUrgentFrame,
     TranscriptionFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
@@ -53,9 +54,19 @@ from core.audio_config import (
 from core.realtime_gate import realtime_turn_gate
 
 
-def transport_server_message(message_type: str, payload: dict) -> OutputTransportMessageFrame:
+def transport_server_message(
+    message_type: str,
+    payload: dict,
+    *,
+    urgent: bool = False,
+) -> OutputTransportMessageFrame | OutputTransportMessageUrgentFrame:
     """Build the custom RTVI transport envelope consumed by the web client."""
-    return OutputTransportMessageFrame({
+    frame_type = (
+        OutputTransportMessageUrgentFrame
+        if urgent
+        else OutputTransportMessageFrame
+    )
+    return frame_type({
         "label": "rtvi-ai",
         "type": "server-message",
         "data": {"type": message_type, "payload": payload},
@@ -69,6 +80,8 @@ class TurnLatencyState:
         default=None, repr=False
     )
     session_id: str | None = None
+    stt_provider: str | None = None
+    stt_model: str | None = None
     llm_provider: str | None = None
     llm_model: str | None = None
     tts_provider: str | None = None
@@ -98,6 +111,7 @@ class TurnLatencyState:
     rag_bypassed: bool = False
     response_finished: bool = False
     cancelled: bool = False
+    latency_stages_emitted: set[str] = field(default_factory=set, repr=False)
 
     def __post_init__(self):
         self.stage_times = {}
@@ -112,6 +126,10 @@ class TurnLatencyState:
     def mark_user_started(self):
         if self.speech_turn_open:
             return
+        # A barge-in can begin a new VAD turn before the downstream
+        # InterruptionFrame from the user aggregator arrives. Release any
+        # previous response gate while its original turn id is still known.
+        realtime_turn_gate.end(self.priority_key)
         self.turn_id += 1
         # Response-relative timing is assigned at final STT. Clearing it here
         # prevents this speech event from inheriting the previous turn origin.
@@ -125,6 +143,7 @@ class TurnLatencyState:
         self.final_stt_at = None
         self.interim_stt_count = 0
         self.final_stt_fragment_count = 0
+        self.latency_stages_emitted.clear()
         self.stage_times = {"user_started": self.speech_started_at}
         self.emit("user_started")
 
@@ -135,6 +154,12 @@ class TurnLatencyState:
         self.mark_stage("user_stopped", self.speech_stopped_at)
         self.emit("user_stopped")
         self.speech_turn_open = False
+
+    def mark_interruption(self):
+        """Cancel an old response without erasing a newly opened speech turn."""
+        if self.speech_turn_open:
+            return
+        self.finish_turn()
 
     def mark_vad_user_stopped(self, stop_secs: float) -> None:
         """Record the estimated last speech sample before VAD confirmation."""
@@ -166,6 +191,7 @@ class TurnLatencyState:
             self.speech_stopped_at = None
             self.audio_speech_stopped_at = None
             self.final_stt_at = None
+            self.latency_stages_emitted.clear()
             self.stage_times = {}
         self.active = True
         self.started_at = self.final_stt_at or time.monotonic()
@@ -244,6 +270,8 @@ class TurnLatencyState:
         return {
             "session_id": self.session_id,
             "basis": "user_stopped" if self.speech_stopped_at is not None else "final_stt",
+            "stt_provider": self.stt_provider,
+            "stt_model": self.stt_model,
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
             "tts_provider": self.tts_provider,
@@ -255,6 +283,77 @@ class TurnLatencyState:
             "stages_ms": stages_ms,
             "server_emitted_unix_ms": round(time.time() * 1000),
         }
+
+    @staticmethod
+    def _stage_delta_ms(start: float | None, end: float | None) -> float | None:
+        if start is None or end is None:
+            return None
+        return max(0.0, round((end - start) * 1000, 1))
+
+    def latency_stats_payload(self, stage: str) -> dict:
+        """Build the progressively complete latency snapshot for one turn."""
+        stages = self.stage_times or {}
+        audio_at = stages.get("first_tts_audio")
+        speakable_at = stages.get("first_speakable_text")
+        tts_request_at = stages.get("tts_request_started")
+        speech_origin = self.audio_speech_stopped_at or self.speech_stopped_at
+        response_origin = speech_origin or self.final_stt_at or self.started_at
+        category = "tool" if self.tool_used else "rag" if self.rag_used else "direct"
+
+        return {
+            "turn_id": self.turn_id,
+            "latency_stage": stage,
+            "latency_complete": stage == "tts",
+            "category": category,
+            "with_tools": self.tool_used,
+            "rag_used": self.rag_used,
+            "rag_considered": self.rag_considered,
+            "rag_bypassed": self.rag_bypassed,
+            "stt_latency_ms": self._stage_delta_ms(
+                speech_origin,
+                self.final_stt_at,
+            ),
+            # The LLM stage includes retrieval and text aggregation: it ends
+            # exactly when the first request is handed to the TTS provider.
+            "llm_latency_ms": self._stage_delta_ms(
+                self.final_stt_at,
+                tts_request_at,
+            ),
+            "tts_latency_ms": self._stage_delta_ms(
+                tts_request_at,
+                audio_at,
+            ),
+            "llm_ms": self.first_llm_ms,
+            "speakable_text_ms": self.first_speakable_text_ms,
+            "tts_aggregation_ms": self._stage_delta_ms(
+                speakable_at,
+                tts_request_at,
+            ),
+            "tts_provider_ms": self._stage_delta_ms(
+                tts_request_at,
+                audio_at,
+            ),
+            "speakable_to_audio_ms": self._stage_delta_ms(
+                speakable_at,
+                audio_at,
+            ),
+            "answer_audio_ms": self._stage_delta_ms(
+                response_origin,
+                audio_at,
+            ),
+            "final_stt_to_audio_ms": self._stage_delta_ms(
+                self.final_stt_at,
+                audio_at,
+            ),
+            **self.telemetry_payload(),
+        }
+
+    def claim_latency_stage(self, stage: str) -> bool:
+        """Return true once for each progressive telemetry stage in a turn."""
+        if stage in self.latency_stages_emitted:
+            return False
+        self.latency_stages_emitted.add(stage)
+        return True
 
     def emit(self, stage: str):
         if stage in {"user_started", "user_stopped"}:
@@ -277,19 +376,29 @@ class LatencyBoundaryProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         telemetry_frame = None
+        # The user aggregator owns VAD and broadcasts these system frames
+        # upstream. This boundary is intentionally placed immediately before
+        # the aggregator, so it records the event before segmented STT runs.
+        if self._boundary == "vad":
+            if isinstance(frame, VADUserStartedSpeakingFrame):
+                self._state.mark_user_started()
+            elif isinstance(frame, VADUserStoppedSpeakingFrame):
+                self._state.mark_vad_user_stopped(frame.stop_secs)
         if direction == FrameDirection.DOWNSTREAM:
             if self._boundary == "turn" and isinstance(frame, UserStartedSpeakingFrame):
                 self._state.mark_user_started()
             elif self._boundary == "turn" and isinstance(frame, UserStoppedSpeakingFrame):
                 self._state.mark_user_stopped()
-            elif self._boundary == "vad" and isinstance(frame, VADUserStartedSpeakingFrame):
-                self._state.mark_user_started()
-            elif self._boundary == "vad" and isinstance(frame, VADUserStoppedSpeakingFrame):
-                self._state.mark_vad_user_stopped(frame.stop_secs)
             elif self._boundary == "turn" and isinstance(frame, LLMContextFrame):
                 self._state.start_turn()
+                if self._state.claim_latency_stage("stt"):
+                    telemetry_frame = transport_server_message(
+                        "latency_stats",
+                        self._state.latency_stats_payload("stt"),
+                        urgent=True,
+                    )
             elif self._boundary == "turn" and isinstance(frame, InterruptionFrame):
-                self._state.finish_turn()
+                self._state.mark_interruption()
             elif self._boundary == "stt" and isinstance(frame, TranscriptionFrame):
                 self._state.record_final_stt_fragment()
             elif self._boundary == "stt" and isinstance(frame, InterimTranscriptionFrame):
@@ -315,8 +424,14 @@ class LatencyBoundaryProcessor(FrameProcessor):
                 and isinstance(frame, TTSStartedFrame)
                 and self._state.first_llm_seen
             ):
-                self._state.mark_stage("tts_request_started")
-                self._state.emit("tts_request_started")
+                if self._state.claim_latency_stage("llm"):
+                    self._state.mark_stage("tts_request_started")
+                    self._state.emit("tts_request_started")
+                    telemetry_frame = transport_server_message(
+                        "latency_stats",
+                        self._state.latency_stats_payload("llm"),
+                        urgent=True,
+                    )
             elif (
                 self._boundary == "tts"
                 and isinstance(frame, TTSAudioRawFrame)
@@ -325,51 +440,16 @@ class LatencyBoundaryProcessor(FrameProcessor):
                 and not self._state.cancelled
             ):
                 self._state.first_audio_seen = True
+                self._state.claim_latency_stage("tts")
                 realtime_turn_gate.end(self._state.priority_key)
-                self._state.mark_stage("first_tts_audio")
-                self._state.emit("first_tts_audio")
                 audio_at = time.monotonic()
-                response_origin = (
-                    self._state.audio_speech_stopped_at
-                    or self._state.speech_stopped_at
-                    or self._state.final_stt_at
-                    or self._state.started_at
+                self._state.mark_stage("first_tts_audio", audio_at)
+                self._state.emit("first_tts_audio")
+                telemetry_frame = transport_server_message(
+                    "latency_stats",
+                    self._state.latency_stats_payload("tts"),
+                    urgent=True,
                 )
-                total_ms = round((audio_at - response_origin) * 1000, 1) if response_origin else None
-                final_stt_to_audio_ms = round(
-                    (audio_at - self._state.final_stt_at) * 1000, 1
-                ) if self._state.final_stt_at else None
-                stages = self._state.stage_times or {}
-                speakable_at = stages.get("first_speakable_text")
-                tts_request_at = stages.get("tts_request_started")
-
-                def stage_delta(start, end):
-                    return round((end - start) * 1000, 1) if start and end else None
-
-                category = "tool" if self._state.tool_used else "rag" if self._state.rag_used else "direct"
-                telemetry_frame = OutputTransportMessageFrame({
-                        "label": "rtvi-ai",
-                        "type": "server-message",
-                        "data": {
-                            "type": "latency_stats",
-                            "payload": {
-                                "turn_id": self._state.turn_id,
-                                "category": category,
-                                "with_tools": self._state.tool_used,
-                                "rag_used": self._state.rag_used,
-                                "rag_considered": self._state.rag_considered,
-                                "rag_bypassed": self._state.rag_bypassed,
-                                "llm_ms": self._state.first_llm_ms,
-                                "speakable_text_ms": self._state.first_speakable_text_ms,
-                                "tts_aggregation_ms": stage_delta(speakable_at, tts_request_at),
-                                "tts_provider_ms": stage_delta(tts_request_at, audio_at),
-                                "speakable_to_audio_ms": stage_delta(speakable_at, audio_at),
-                                "answer_audio_ms": total_ms,
-                                "final_stt_to_audio_ms": final_stt_to_audio_ms,
-                                **self._state.telemetry_payload(),
-                            },
-                        },
-                    })
                 if self._state.response_finished:
                     self._state.turn_identity_open = False
             elif (
@@ -381,9 +461,12 @@ class LatencyBoundaryProcessor(FrameProcessor):
                 # Empty, cancelled, or provider-failed responses must never
                 # leave background enrichment gated forever.
                 self._state.finish_turn()
-        await self.push_frame(frame, direction)
+        # Urgent telemetry must lead the corresponding work/media frame. This
+        # both bypasses TTS media serialization and lets the browser associate
+        # its first decoded audio sample with the correct turn.
         if telemetry_frame:
             await self.push_frame(telemetry_frame, direction)
+        await self.push_frame(frame, direction)
 
 
 class LeadingSilenceTrimmerProcessor(FrameProcessor):
@@ -1215,20 +1298,25 @@ class ContextRetrievalProcessor(FrameProcessor):
                     memory_query_embedding = (
                         asyncio.shield(shared_embedding) if shared_embedding else None
                     )
-                    rag_query_embedding = (
-                        asyncio.shield(shared_embedding) if shared_embedding else None
-                    )
                     memory_task = build_turn_memory_context(
                         self._user_id,
                         combined_query,
                         query_embedding=memory_query_embedding,
                         current_conversation_id=self._conversation_id,
                     ) if needs_memory else asyncio.sleep(0, result=None)
-                    rag_task = build_rag_context_with_payload(
-                        self._user_id,
-                        combined_query,
-                        query_embedding=rag_query_embedding,
-                    ) if needs_rag else asyncio.sleep(0, result=(None, None))
+                    if needs_rag:
+                        rag_kwargs = (
+                            {"query_embedding": asyncio.shield(shared_embedding)}
+                            if shared_embedding
+                            else {}
+                        )
+                        rag_task = build_rag_context_with_payload(
+                            self._user_id,
+                            combined_query,
+                            **rag_kwargs,
+                        )
+                    else:
+                        rag_task = asyncio.sleep(0, result=(None, None))
                     web_task = self._web_search(combined_query) if needs_web else asyncio.sleep(0, result=None)
                     web_fallback = {
                         "status": "timeout",

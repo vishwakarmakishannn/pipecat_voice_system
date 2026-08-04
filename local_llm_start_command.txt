@@ -1,0 +1,30 @@
+./llama.cpp/build/bin/llama-server \
+  -m /Users/ll/Documents/voice_system/pipecat_with_rag/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  --alias qwen3-4b-local \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -c 8192 \
+  -np 1 \
+  -ngl 99 \
+  -fa on \
+  --jinja \
+  --log-disable \
+  --no-perf
+
+
+
+./llama.cpp/build/bin/llama-server \
+  -m /Users/ll/Documents/voice_system/pipecat_with_rag/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  --alias qwen3-4b-local \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -c 8192 \
+  -np 1 \
+  -ngl all \
+  -fa on \
+  --jinja \
+  --cache-prompt \
+  --cache-ram 2048 \
+  --load-mode mmap+mlock \
+  --log-disable \
+  --no-perf

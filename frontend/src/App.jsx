@@ -450,12 +450,19 @@ function VoiceApp({ onResetClient }) {
   const commitClientLatency = useCallback(async () => {
     const pending = pendingLatencyRef.current;
     const timing = voiceTurnTimingRef.current;
-    if (!pending || timing.firstRemoteAudioAt == null) return;
+    if (
+      !pending
+      || !pending.serverPayload?.latency_complete
+      || timing.firstRemoteAudioAt == null
+    ) return;
 
     const clientMetrics = {
-      client_message_to_audio_ms: Math.round(
-        (timing.firstRemoteAudioAt - pending.receivedPerfAt) * 10,
-      ) / 10,
+      client_message_to_audio_ms: Math.max(
+        0,
+        Math.round(
+          (timing.firstRemoteAudioAt - pending.receivedPerfAt) * 10,
+        ) / 10,
+      ),
       user_stop_to_playback_ms: timing.inputMode === 'text' || timing.speechStoppedAt == null
         ? null
         : Math.round((timing.firstRemoteAudioAt - timing.speechStoppedAt) * 10) / 10,
@@ -531,8 +538,13 @@ function VoiceApp({ onResetClient }) {
       }
       if (!participant?.local) {
         window.setTimeout(() => {
-          ensureBotAudioPlayback().catch((playbackError) => {
-            setError(`Browser blocked bot audio playback: ${playbackError?.message || playbackError}`);
+          ensureBotAudioPlayback(track).catch((playbackError) => {
+            const message = playbackError?.message || playbackError;
+            setError(
+              playbackError?.name === 'NotAllowedError'
+                ? `Browser blocked bot audio playback: ${message}`
+                : `Could not start bot audio playback: ${message}`,
+            );
           });
         }, 0);
       }
@@ -686,29 +698,44 @@ function VoiceApp({ onResetClient }) {
       if (messageData?.type === 'latency_stats' && messageData.payload) {
         const receivedPerfAt = performance.now();
         const timing = voiceTurnTimingRef.current;
-        // RemoteAudioLevel can be unavailable or remain continuously non-zero
-        // across adjacent TTS responses. The server emits this message beside
-        // the first generated audio frame, so use its receipt as a bounded
-        // text-turn fallback and refine it later if decoded audio is observed.
-        const textSendToAudioMs = timing.inputMode === 'text' && timing.textSubmittedAt != null
+        const payload = messageData.payload;
+        const previousPending = pendingLatencyRef.current;
+        const sameTurn = previousPending?.turnId === payload.turn_id;
+        const serverPayload = sameTurn
+          ? { ...(previousPending.serverPayload || {}), ...payload }
+          : payload;
+        // Only the completed server snapshot corresponds to first generated
+        // audio. Earlier STT/LLM snapshots progressively fill the breakdown.
+        const textSendToAudioMs = (
+          payload.latency_complete
+          && timing.inputMode === 'text'
+          && timing.textSubmittedAt != null
+        )
           ? Math.max(0, Math.round((receivedPerfAt - timing.textSubmittedAt) * 10) / 10)
           : null;
         pendingLatencyRef.current = {
-          turnId: messageData.payload.turn_id,
-          receivedPerfAt,
-          serverPayload: messageData.payload,
+          turnId: payload.turn_id,
+          receivedPerfAt: payload.latency_complete
+            ? receivedPerfAt
+            : sameTurn
+              ? previousPending.receivedPerfAt
+              : receivedPerfAt,
+          serverPayload,
         };
-        setLiveLatency({
-          ...messageData.payload,
-          text_send_to_playback_ms: textSendToAudioMs,
-          speech_end_signal: textSendToAudioMs == null
-            ? messageData.payload.speech_end_signal
-            : 'text_submitted',
-          playback_signal: textSendToAudioMs == null
-            ? messageData.payload.playback_signal
-            : 'first_audio_server_signal',
+        const latencyUpdate = {
+          ...serverPayload,
+          ...(textSendToAudioMs == null ? {} : {
+            text_send_to_playback_ms: textSendToAudioMs,
+            speech_end_signal: 'text_submitted',
+            playback_signal: 'first_audio_server_signal',
+          }),
           client_received_unix_ms: Date.now(),
-        });
+        };
+        setLiveLatency((current) => (
+          current?.turn_id === payload.turn_id
+            ? { ...current, ...latencyUpdate }
+            : latencyUpdate
+        ));
         commitClientLatency();
         return;
       }

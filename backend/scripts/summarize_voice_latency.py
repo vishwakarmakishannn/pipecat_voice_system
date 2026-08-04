@@ -10,6 +10,9 @@ from pathlib import Path
 DEFAULT_METRICS = (
     "answer_audio_ms",
     "user_stop_to_playback_ms",
+    "stt_latency_ms",
+    "llm_latency_ms",
+    "tts_latency_ms",
     "llm_ms",
     "tts_aggregation_ms",
     "tts_provider_ms",

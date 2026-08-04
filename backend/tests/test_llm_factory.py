@@ -12,6 +12,7 @@ from providers.llm.factory import get_llm
         ("google", "providers.llm.google_llm", "get_google_llm"),
         ("groq", "providers.llm.groq_llm", "get_groq_llm"),
         ("openai", "providers.llm.openai_llm", "get_openai_llm"),
+        ("local", "providers.local.llm.local_llm", "get_local_llm"),
     ],
 )
 def test_factory_constructs_exactly_one_selected_provider(
@@ -40,6 +41,9 @@ def test_factory_constructs_exactly_one_selected_provider(
         "providers.llm.openai_llm": SimpleNamespace(
             get_openai_llm=factory("openai", marker if provider == "openai" else None)
         ),
+        "providers.local.llm.local_llm": SimpleNamespace(
+            get_local_llm=factory("local", marker if provider == "local" else None)
+        ),
     }
     for module_name, module in modules.items():
         monkeypatch.setitem(sys.modules, module_name, module)
@@ -55,8 +59,67 @@ def test_factory_constructs_exactly_one_selected_provider(
 def test_factory_rejects_unsupported_provider(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "unknown")
 
-    with pytest.raises(ValueError, match="Expected google, groq, or openai"):
+    with pytest.raises(
+        ValueError,
+        match="Expected google, groq, openai, or local",
+    ):
         get_llm()
+
+
+def test_local_failure_does_not_fall_back_to_cloud(monkeypatch):
+    cloud_calls = []
+
+    def fail_local():
+        raise RuntimeError("local server unavailable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "providers.local.llm.local_llm",
+        SimpleNamespace(get_local_llm=fail_local),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "providers.llm.groq_llm",
+        SimpleNamespace(get_groq_llm=lambda: cloud_calls.append("groq")),
+    )
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+
+    with pytest.raises(RuntimeError, match="local server unavailable"):
+        get_llm()
+    assert cloud_calls == []
+
+
+@pytest.mark.anyio
+async def test_lifecycle_only_warms_and_closes_local(monkeypatch):
+    from providers.llm.factory import shutdown_llm_provider, warm_llm_provider
+
+    calls = []
+
+    async def warm():
+        calls.append("warm")
+
+    async def close():
+        calls.append("close")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "providers.local.llm.runtime",
+        SimpleNamespace(
+            warm_local_llm_runtime=warm,
+            shutdown_local_llm_runtime=close,
+        ),
+    )
+    monkeypatch.setenv("LLM_PROVIDER", " LOCAL ")
+
+    await warm_llm_provider()
+    await shutdown_llm_provider()
+    assert calls == ["warm", "close"]
+
+    calls.clear()
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    await warm_llm_provider()
+    await shutdown_llm_provider()
+    assert calls == []
 
 
 def test_google_builder_has_no_cross_provider_fallback(monkeypatch):

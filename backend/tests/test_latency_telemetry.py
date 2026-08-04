@@ -16,6 +16,37 @@ def test_voice_latency_schema_rejects_transcript_content():
         )
 
 
+def test_voice_latency_schema_accepts_stt_identity():
+    telemetry = VoiceLatencyTelemetry(
+        turn_id=1,
+        category="direct",
+        stt_provider="whisper",
+        stt_model="small",
+    )
+
+    assert telemetry.stt_provider == "whisper"
+    assert telemetry.stt_model == "small"
+
+
+def test_voice_latency_schema_accepts_pipeline_stage_breakdown():
+    telemetry = VoiceLatencyTelemetry(
+        turn_id=1,
+        latency_stage="tts",
+        latency_complete=True,
+        category="direct",
+        stt_latency_ms=415.1,
+        llm_latency_ms=108.7,
+        tts_latency_ms=3089.2,
+        answer_audio_ms=3613.0,
+    )
+
+    assert telemetry.stt_latency_ms == 415.1
+    assert telemetry.llm_latency_ms == 108.7
+    assert telemetry.tts_latency_ms == 3089.2
+    assert telemetry.latency_stage == "tts"
+    assert telemetry.latency_complete is True
+
+
 @pytest.mark.anyio
 async def test_voice_latency_jsonl_is_persisted(monkeypatch, tmp_path):
     output = tmp_path / "voice.jsonl"
@@ -40,6 +71,9 @@ def test_latency_summary_separates_category_and_warmth():
                 "category": "direct",
                 "llm_connection_warmed": True,
                 "answer_audio_ms": 400,
+                "stt_latency_ms": 100,
+                "llm_latency_ms": 100,
+                "tts_latency_ms": 200,
             },
             {
                 "category": "direct",
@@ -56,5 +90,8 @@ def test_latency_summary_separates_category_and_warmth():
 
     assert report["direct:warm"]["metrics"]["answer_audio_ms"]["p50"] == 400.0
     assert report["direct:warm"]["metrics"]["answer_audio_ms"]["p95"] == 600.0
+    assert report["direct:warm"]["metrics"]["stt_latency_ms"]["p50"] == 100.0
+    assert report["direct:warm"]["metrics"]["llm_latency_ms"]["p50"] == 100.0
+    assert report["direct:warm"]["metrics"]["tts_latency_ms"]["p50"] == 200.0
     assert report["rag:cold"]["turns"] == 1
     assert percentile([], 0.5) is None

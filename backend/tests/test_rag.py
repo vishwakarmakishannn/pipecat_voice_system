@@ -10,14 +10,21 @@ from core.processors import (
     TurnLatencyState,
 )
 from pipecat.frames.frames import (
+    InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMTextFrame,
     OutputTransportMessageFrame,
+    OutputTransportMessageUrgentFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
+    TTSStartedFrame,
     TTSStoppedFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -420,13 +427,71 @@ def test_smart_router_allows_text_only_fallback_when_rank_is_strong():
             page_start=1,
             page_end=1,
             heading_path=None,
-            score=0.50,
+            score=0.10,
             text_rank=0.2,
             source_types=("text",),
         )
     ]
 
     assert should_inject_rag_context(chunks, query="What is the device ID of Rohan Sharma?")
+
+
+@pytest.mark.anyio
+async def test_strong_text_match_returns_before_slow_query_embedding(monkeypatch):
+    chunk = SimpleNamespace(
+        id=8,
+        file_id=5,
+        content="Rohan Sharma reported an issue with his Mswipe device.",
+        page_start=1,
+        page_end=1,
+        heading_path=None,
+        chunk_index=0,
+    )
+    rag_file = SimpleNamespace(
+        filename="issue.pdf",
+        source_type="pdf",
+        final_url=None,
+        url=None,
+        title=None,
+        site_name=None,
+    )
+    vector_called = False
+
+    async def slow_embedding(_query):
+        await asyncio.sleep(10)
+
+    async def vector_candidates(_user_id, _embedding):
+        nonlocal vector_called
+        vector_called = True
+        return []
+
+    async def text_candidates(_user_id, _query):
+        return [(chunk, rag_file, 0.3)]
+
+    monkeypatch.setattr(rag_service, "embed_text", slow_embedding)
+    monkeypatch.setattr(
+        rag_service,
+        "_retrieve_vector_candidates",
+        vector_candidates,
+    )
+    monkeypatch.setattr(
+        rag_service,
+        "_retrieve_text_candidates",
+        text_candidates,
+    )
+
+    result = await asyncio.wait_for(
+        rag_service._retrieve_rag_chunks_uncached(
+            1,
+            "Give me information on Rohan Sharma from the PDF.",
+        ),
+        timeout=0.2,
+    )
+
+    assert [item.content for item in result] == [chunk.content]
+    assert result[0].text_rank == 0.3
+    assert result[0].vector_similarity is None
+    assert vector_called is False
 
 
 def test_latency_state_counts_transcript_fragments_as_one_active_turn():
@@ -490,6 +555,92 @@ def test_latency_state_reports_interim_and_final_stt_counts():
     assert "turn_ready" in payload["stages_ms"]
 
 
+def test_latency_state_reports_stt_identity():
+    state = TurnLatencyState(
+        session_id="test",
+        stt_provider="whisper",
+        stt_model="small",
+    )
+
+    payload = state.telemetry_payload()
+
+    assert payload["stt_provider"] == "whisper"
+    assert payload["stt_model"] == "small"
+
+
+@pytest.mark.anyio
+async def test_vad_stt_latency_survives_turn_start_interruption(monkeypatch):
+    state = TurnLatencyState(session_id="test")
+    vad_boundary = LatencyBoundaryProcessor(state, "vad", enable_direct_mode=True)
+    stt_boundary = LatencyBoundaryProcessor(state, "stt", enable_direct_mode=True)
+    turn_boundary = LatencyBoundaryProcessor(state, "turn", enable_direct_mode=True)
+    tts_boundary = LatencyBoundaryProcessor(state, "tts", enable_direct_mode=True)
+    delivered = []
+
+    async def discard(_frame, _direction):
+        return None
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    monkeypatch.setattr(vad_boundary, "push_frame", discard)
+    monkeypatch.setattr(stt_boundary, "push_frame", discard)
+    monkeypatch.setattr(turn_boundary, "push_frame", discard)
+    monkeypatch.setattr(tts_boundary, "push_frame", capture)
+    now = [10.0]
+    monkeypatch.setattr("core.processors.time.monotonic", lambda: now[0])
+
+    await vad_boundary.process_frame(
+        VADUserStartedSpeakingFrame(start_secs=0.15),
+        FrameDirection.UPSTREAM,
+    )
+    await turn_boundary.process_frame(
+        UserStartedSpeakingFrame(),
+        FrameDirection.DOWNSTREAM,
+    )
+    await turn_boundary.process_frame(
+        InterruptionFrame(),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    now[0] = 12.0
+    await vad_boundary.process_frame(
+        VADUserStoppedSpeakingFrame(stop_secs=0.2),
+        FrameDirection.UPSTREAM,
+    )
+    now[0] = 12.5
+    await stt_boundary.process_frame(
+        TranscriptionFrame("hello", "", "", finalized=True),
+        FrameDirection.DOWNSTREAM,
+    )
+    now[0] = 12.6
+    await turn_boundary.process_frame(
+        UserStoppedSpeakingFrame(),
+        FrameDirection.DOWNSTREAM,
+    )
+    now[0] = 12.7
+    state.start_turn()
+    state.first_llm_seen = True
+    state.first_speakable_text_seen = True
+    state.mark_stage("first_speakable_text", 12.8)
+    state.mark_stage("tts_request_started", 12.9)
+
+    now[0] = 13.0
+    await tts_boundary.process_frame(
+        TTSAudioRawFrame(b"\x01\x00", 24000, 1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    payload = delivered[0].message["data"]["payload"]
+    assert state.turn_id == 1
+    assert payload["stt_latency_ms"] == 700.0
+    assert payload["llm_latency_ms"] == 400.0
+    assert payload["tts_latency_ms"] == 100.0
+    assert payload["answer_audio_ms"] == 1200.0
+    assert payload["latency_stage"] == "tts"
+    assert payload["latency_complete"] is True
+
+
 @pytest.mark.anyio
 async def test_llm_latency_distinguishes_first_frame_from_speakable_text(monkeypatch):
     state = TurnLatencyState(session_id="test")
@@ -512,6 +663,87 @@ async def test_llm_latency_distinguishes_first_frame_from_speakable_text(monkeyp
     assert state.first_speakable_text_seen is True
     assert state.first_speakable_text_ms is not None
     assert state.stage_times["first_speakable_text"] >= state.stage_times["first_llm_text"]
+
+
+@pytest.mark.anyio
+async def test_latency_stages_are_emitted_urgently_as_they_complete(monkeypatch):
+    state = TurnLatencyState(session_id="test")
+    turn_boundary = LatencyBoundaryProcessor(state, "turn")
+    llm_boundary = LatencyBoundaryProcessor(state, "llm")
+    tts_boundary = LatencyBoundaryProcessor(state, "tts")
+    turn_delivered = []
+    tts_delivered = []
+
+    async def capture_turn(frame, _direction):
+        turn_delivered.append(frame)
+
+    async def discard(_frame, _direction):
+        return None
+
+    async def capture_tts(frame, _direction):
+        tts_delivered.append(frame)
+
+    monkeypatch.setattr(turn_boundary, "push_frame", capture_turn)
+    monkeypatch.setattr(llm_boundary, "push_frame", discard)
+    monkeypatch.setattr(tts_boundary, "push_frame", capture_tts)
+    now = [10.0]
+    monkeypatch.setattr("core.processors.time.monotonic", lambda: now[0])
+
+    state.mark_user_started()
+    now[0] = 12.0
+    state.mark_vad_user_stopped(0.2)
+    now[0] = 12.5
+    state.record_final_stt_fragment()
+    context_frame = LLMContextFrame(LLMContext(messages=[]))
+    await turn_boundary.process_frame(context_frame, FrameDirection.DOWNSTREAM)
+
+    assert isinstance(turn_delivered[0], OutputTransportMessageUrgentFrame)
+    assert turn_delivered[1] is context_frame
+    stt_payload = turn_delivered[0].message["data"]["payload"]
+    assert stt_payload["latency_stage"] == "stt"
+    assert stt_payload["latency_complete"] is False
+    assert stt_payload["stt_latency_ms"] == 700.0
+    assert stt_payload["llm_latency_ms"] is None
+
+    # A repeated context in the same turn must not emit duplicate STT telemetry.
+    await turn_boundary.process_frame(context_frame, FrameDirection.DOWNSTREAM)
+    assert turn_delivered[2] is context_frame
+
+    now[0] = 12.6
+    await llm_boundary.process_frame(
+        LLMTextFrame("Hello"),
+        FrameDirection.DOWNSTREAM,
+    )
+    now[0] = 12.9
+    started = TTSStartedFrame()
+    await tts_boundary.process_frame(started, FrameDirection.DOWNSTREAM)
+
+    assert isinstance(tts_delivered[0], OutputTransportMessageUrgentFrame)
+    assert tts_delivered[1] is started
+    llm_payload = tts_delivered[0].message["data"]["payload"]
+    assert llm_payload["latency_stage"] == "llm"
+    assert llm_payload["latency_complete"] is False
+    assert llm_payload["stt_latency_ms"] == 700.0
+    assert llm_payload["llm_latency_ms"] == 400.0
+    assert llm_payload["tts_latency_ms"] is None
+
+    now[0] = 13.0
+    audio = TTSAudioRawFrame(b"\x01\x00", 24000, 1)
+    await tts_boundary.process_frame(audio, FrameDirection.DOWNSTREAM)
+
+    assert isinstance(tts_delivered[2], OutputTransportMessageUrgentFrame)
+    assert tts_delivered[3] is audio
+    final_payload = tts_delivered[2].message["data"]["payload"]
+    assert final_payload["latency_stage"] == "tts"
+    assert final_payload["latency_complete"] is True
+    assert final_payload["tts_latency_ms"] == 100.0
+    assert final_payload["answer_audio_ms"] == 1200.0
+    assert (
+        final_payload["stt_latency_ms"]
+        + final_payload["llm_latency_ms"]
+        + final_payload["tts_latency_ms"]
+        == final_payload["answer_audio_ms"]
+    )
 
 
 def test_latency_turn_identity_starts_with_speech_not_final_transcript():
@@ -549,7 +781,7 @@ def test_latency_state_reports_endpoint_relative_stage_telemetry():
 
 
 @pytest.mark.anyio
-async def test_first_audio_is_pushed_before_latency_diagnostics(monkeypatch):
+async def test_urgent_latency_diagnostics_lead_first_audio(monkeypatch):
     state = TurnLatencyState(session_id="test")
     state.start_turn()
     state.first_llm_seen = True
@@ -564,8 +796,9 @@ async def test_first_audio_is_pushed_before_latency_diagnostics(monkeypatch):
     audio = TTSAudioRawFrame(b"\x00\x00", 24000, 1)
     await boundary.process_frame(audio, FrameDirection.DOWNSTREAM)
 
-    assert delivered[0] is audio
-    assert isinstance(delivered[1], OutputTransportMessageFrame)
+    assert isinstance(delivered[0], OutputTransportMessageUrgentFrame)
+    assert delivered[0].message["data"]["payload"]["latency_stage"] == "tts"
+    assert delivered[1] is audio
 
 
 @pytest.mark.anyio
@@ -592,9 +825,12 @@ async def test_answer_audio_uses_turn_release_not_final_stt_as_origin(monkeypatc
         FrameDirection.DOWNSTREAM,
     )
 
-    payload = delivered[1].message["data"]["payload"]
+    payload = delivered[0].message["data"]["payload"]
     assert payload["answer_audio_ms"] == 11000.0
     assert payload["final_stt_to_audio_ms"] == 8000.0
+    assert payload["stt_latency_ms"] == 3000.0
+    assert payload["llm_latency_ms"] == 7000.0
+    assert payload["tts_latency_ms"] == 1000.0
     assert payload["tts_aggregation_ms"] == 1000.0
     assert payload["tts_provider_ms"] == 1000.0
     assert payload["speakable_to_audio_ms"] == 2000.0
@@ -775,6 +1011,44 @@ async def test_combined_memory_and_rag_share_one_embedding(monkeypatch):
 
     assert embedding_calls == 1
     assert seen_embeddings == [[0.5], [0.5]]
+
+
+@pytest.mark.anyio
+async def test_rag_only_route_does_not_disable_query_embedding(monkeypatch):
+    default_embedding = object()
+    seen_embedding = None
+    processor = ContextRetrievalProcessor(1, 1, LLMContext(messages=[]))
+    processor._retrieval_generation = 1
+
+    async def fake_rag(
+        _user_id,
+        _query,
+        query_embedding=default_embedding,
+    ):
+        nonlocal seen_embedding
+        seen_embedding = query_embedding
+        return None, None
+
+    async def capture(_frame, _direction):
+        return None
+
+    monkeypatch.setattr(
+        "core.processors.build_rag_context_with_payload",
+        fake_rag,
+    )
+    monkeypatch.setattr(processor, "push_frame", capture)
+
+    await processor._retrieve_and_push(
+        TranscriptionFrame("Rohan Sharma from the PDF", "user", "1", finalized=True),
+        "Rohan Sharma from the PDF",
+        FrameDirection.DOWNSTREAM,
+        False,
+        True,
+        False,
+        1,
+    )
+
+    assert seen_embedding is default_embedding
 
 
 @pytest.mark.anyio

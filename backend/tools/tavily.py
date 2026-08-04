@@ -25,11 +25,15 @@ async def run_web_search(query: str) -> dict:
     try:
         async with asyncio.timeout(web_search_timeout_seconds()):
             result = await client.search(
-            query=query,
-            search_depth="fast",
-            max_results=5,
-            include_answer=True,
-            include_raw_content=False,
+                query=query,
+                search_depth="basic",
+                max_results=3,
+                chunks_per_source=1,
+                include_answer=False,
+                include_raw_content=False,
+                include_images=False,
+                include_favicon=False,
+                auto_parameters=False,
             )
     except TimeoutError:
         return {
@@ -50,7 +54,7 @@ async def run_web_search(query: str) -> dict:
             {
                 "title": item.get("title"),
                 "url": item.get("url"),
-                "content": (item.get("content") or "")[:600],
+                "content": (item.get("content") or ""),
             }
             for item in result.get("results", [])[:3]
         ],

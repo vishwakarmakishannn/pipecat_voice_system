@@ -10,9 +10,18 @@ def test_remote_tts_defaults_to_token_streaming(monkeypatch):
     assert get_text_aggregation_mode("cartesia") is TextAggregationMode.TOKEN
 
 
-def test_local_piper_defaults_to_sentence_aggregation(monkeypatch):
+@pytest.mark.parametrize("provider", ["kokoro", "piper"])
+def test_local_tts_defaults_to_sentence_aggregation(monkeypatch, provider):
     monkeypatch.delenv("TTS_TEXT_AGGREGATION_MODE", raising=False)
+    assert get_text_aggregation_mode(provider) is TextAggregationMode.SENTENCE
+
+
+def test_auto_mode_keeps_local_tts_sentence_based(monkeypatch):
+    monkeypatch.setenv("TTS_TEXT_AGGREGATION_MODE", "auto")
+
     assert get_text_aggregation_mode("piper") is TextAggregationMode.SENTENCE
+    assert get_text_aggregation_mode("kokoro") is TextAggregationMode.SENTENCE
+    assert get_text_aggregation_mode("deepgram") is TextAggregationMode.TOKEN
 
 
 def test_tts_aggregation_mode_can_be_overridden(monkeypatch):

@@ -323,6 +323,52 @@ async def test_memory_text_inference_uses_only_selected_llm_provider(monkeypatch
 
 
 @pytest.mark.anyio
+async def test_memory_text_inference_reuses_local_llm_runtime(monkeypatch):
+    calls = []
+
+    class Completions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            message = SimpleNamespace(content='{"events":[]}')
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    config = SimpleNamespace(
+        model="qwen3-4b-local",
+        max_tokens=192,
+        extra_body={
+            "top_k": 20,
+            "min_p": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
+        },
+    )
+    runtime = SimpleNamespace(
+        config=config,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions()),
+        ),
+    )
+
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setattr(memory_service, "_get_local_memory_runtime", lambda: runtime)
+    monkeypatch.setattr(memory_service, "_memory_llm_backoff_until", 0.0)
+
+    response = await memory_service._generate_text_with_memory_llm("prompt")
+
+    assert response == '{"events":[]}'
+    assert calls == [
+        {
+            "model": "qwen3-4b-local",
+            "messages": [{"role": "user", "content": "prompt"}],
+            "stream": False,
+            "temperature": 0.0,
+            "max_tokens": 192,
+            "extra_body": config.extra_body,
+        }
+    ]
+
+
+@pytest.mark.anyio
 async def test_turn_memory_context_formats_retrieved_chunks(monkeypatch):
     async def fake_retrieve(_user_id, _query, _top_k, query_embedding=None):
         assert query_embedding is None

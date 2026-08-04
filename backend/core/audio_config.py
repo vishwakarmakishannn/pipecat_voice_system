@@ -17,8 +17,12 @@ def audio_input_sample_rate() -> int:
 
 
 def audio_output_sample_rate(provider: str | None = None) -> int:
-    provider = (provider or os.getenv("TTS_PROVIDER", "deepgram")).lower()
-    default = 22050 if provider == "piper" else 24000
+    provider = (provider or os.getenv("TTS_PROVIDER", "deepgram")).strip().lower()
+    provider_defaults = {
+        "piper": 22050,
+        "kokoro": 24000,
+    }
+    default = provider_defaults.get(provider, 24000)
     return _sample_rate("AUDIO_OUTPUT_SAMPLE_RATE", default)
 
 

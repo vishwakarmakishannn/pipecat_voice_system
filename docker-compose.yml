@@ -43,16 +43,21 @@ services:
     environment:
       # In Docker, we connect to 'db:5432' instead of 'localhost:5434'
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-pipecat_user}:${POSTGRES_PASSWORD:-pipecat_password}@db:5432/${POSTGRES_DB:-pipecat_db}
+      - MOONSHINE_VOICE_CACHE=/root/.cache/moonshine_voice
     env_file:
       - .env
     # Exposing the backend port internally or via reverse proxy
     ports:
       - "7860:7860"
+    volumes:
+      - kokoro-cache:/root/.cache/pipecat/kokoro-onnx
+      - moonshine-cache:/root/.cache/moonshine_voice
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health/ready', timeout=2)"]
       interval: 10s
       timeout: 3s
       retries: 6
+      start_period: 5m
     restart: unless-stopped
 
   frontend:
@@ -80,3 +85,5 @@ services:
 
 volumes:
   pgdata:
+  kokoro-cache:
+  moonshine-cache:

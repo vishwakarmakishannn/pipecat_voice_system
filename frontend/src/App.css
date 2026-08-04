@@ -1100,6 +1100,35 @@
 .latency-title > span { display: flex; align-items: center; gap: 6px; }
 .latency-latest { justify-content: space-between; margin: 9px 0; font-size: 0.78rem; color: #64748b; }
 .latency-latest strong { color: #7c3aed; font-size: 1rem; }
+.latency-breakdown {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding-top: 9px;
+  border-top: 1px solid #e2e8f0;
+}
+.latency-stage {
+  min-width: 0;
+  padding: 7px 4px;
+  border-radius: 8px;
+  background: #ffffff;
+  text-align: center;
+}
+.latency-stage span {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+.latency-stage strong {
+  display: block;
+  margin-top: 3px;
+  color: #334155;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .latency-footnote { margin-top: 8px; color: #94a3b8; font-size: 0.62rem; text-align: center; }
 
 /* Dark theme overrides for legacy fixed-color surfaces. */
@@ -1151,6 +1180,18 @@
 :root[data-theme='dark'] .latency-panel {
   background: var(--surface-soft);
   border-color: var(--border-color);
+}
+
+:root[data-theme='dark'] .latency-breakdown {
+  border-color: var(--border-color);
+}
+
+:root[data-theme='dark'] .latency-stage {
+  background: var(--surface-raised);
+}
+
+:root[data-theme='dark'] .latency-stage strong {
+  color: var(--text-primary);
 }
 
 :root[data-theme='dark'] .history-item:hover,

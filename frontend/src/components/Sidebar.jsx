@@ -46,6 +46,28 @@ export default function Sidebar({
     item.text_send_to_playback_ms ?? item.user_stop_to_playback_ms ?? item.answer_audio_ms
   );
 
+  const stageLatencies = [
+    {
+      label: 'STT',
+      value: liveLatency?.stt_latency_ms,
+      title: 'Last detected speech sample to final transcript',
+    },
+    {
+      label: 'LLM',
+      value: liveLatency?.llm_latency_ms
+        ?? liveLatency?.speakable_text_ms
+        ?? liveLatency?.llm_ms,
+      title: 'Final transcript to the first TTS request',
+    },
+    {
+      label: 'TTS',
+      value: liveLatency?.tts_latency_ms
+        ?? liveLatency?.speakable_to_audio_ms
+        ?? liveLatency?.tts_provider_ms,
+      title: 'First TTS request to first audible generated audio',
+    },
+  ];
+
   const formatFileSize = (sizeBytes) => {
     if (!sizeBytes) return '0 KB';
     if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`;
@@ -262,6 +284,14 @@ export default function Sidebar({
             <span>{liveLatency ? (liveLatency.with_tools ? 'With tool' : 'Without tool') : 'Waiting for a turn'}</span>
             <strong>{formatLatency(liveLatency ? primaryLatency(liveLatency) : null)}</strong>
           </div>
+          <div className="latency-breakdown" aria-label="Pipeline stage latency">
+            {stageLatencies.map((stage) => (
+              <div className="latency-stage" key={stage.label} title={stage.title}>
+                <span>{stage.label}</span>
+                <strong>{formatLatency(stage.value)}</strong>
+              </div>
+            ))}
+          </div>
           <div className="latency-footnote">
             {liveLatency?.text_send_to_playback_ms != null
               ? 'Text sent → first decoded playback audio'
@@ -269,7 +299,9 @@ export default function Sidebar({
               ? liveLatency.speech_end_signal === 'last_nonzero_local_audio_level'
                 ? `Last local speech → decoded audio${liveLatency.endpointing_ms != null ? ` · endpoint ${formatLatency(liveLatency.endpointing_ms)}` : ''}`
                 : 'Turn-stop signal → first decoded playback audio'
-              : 'Final transcript → first generated answer audio'}
+              : liveLatency?.basis === 'user_stopped'
+                ? 'Last detected speech → first generated answer audio'
+                : 'Final transcript → first generated answer audio'}
           </div>
         </div>
       ) : null}
