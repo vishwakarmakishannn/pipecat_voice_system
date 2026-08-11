@@ -20,11 +20,13 @@ class KokoroTextAggregator(BaseTextAggregator):
         self,
         *,
         first_chunk_chars: int,
+        first_chunk_min_words: int,
         chunk_chars: int,
         min_chunk_words: int,
     ):
         super().__init__(aggregation_type=AggregationType.SENTENCE)
         self._first_chunk_chars = first_chunk_chars
+        self._first_chunk_min_words = first_chunk_min_words
         self._chunk_chars = chunk_chars
         self._min_chunk_words = min_chunk_words
         self._text = ""
@@ -54,7 +56,12 @@ class KokoroTextAggregator(BaseTextAggregator):
             return True
 
         word_count = len(stripped.split())
-        if char in _CLAUSE_BOUNDARIES and word_count >= self._min_chunk_words:
+        min_words = (
+            self._min_chunk_words
+            if self._emitted_chunk
+            else self._first_chunk_min_words
+        )
+        if char in _CLAUSE_BOUNDARIES and word_count >= min_words:
             return True
 
         target_chars = (
@@ -63,7 +70,7 @@ class KokoroTextAggregator(BaseTextAggregator):
         return (
             char.isspace()
             and len(stripped) >= target_chars
-            and word_count >= self._min_chunk_words
+            and word_count >= min_words
         )
 
     def _take_buffer(self) -> Aggregation | None:

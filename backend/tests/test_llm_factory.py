@@ -66,6 +66,26 @@ def test_factory_rejects_unsupported_provider(monkeypatch):
         get_llm()
 
 
+def test_factory_passes_session_instruction_only_to_selected_provider(
+    monkeypatch,
+):
+    captured = {}
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return "llm"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "providers.llm.groq_llm",
+        SimpleNamespace(get_groq_llm=build),
+    )
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+
+    assert get_llm(system_instruction="session prompt") == "llm"
+    assert captured == {"system_instruction": "session prompt"}
+
+
 def test_local_failure_does_not_fall_back_to_cloud(monkeypatch):
     cloud_calls = []
 
@@ -224,7 +244,7 @@ def test_groq_builder_sends_completion_controls_through_settings_extra(monkeypat
     assert captured["settings"].values["extra"] == {
         "parallel_tool_calls": False,
         "reasoning_effort": "low",
-        "include_reasoning": False,
+        "extra_body": {"include_reasoning": False},
     }
     assert "client_kwargs" not in captured
 

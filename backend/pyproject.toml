@@ -11,6 +11,7 @@ requires-python = ">=3.14"
 dependencies = [
     "pipecat-ai[cartesia,daily,deepgram,openai,google,kokoro,silero,runner,webrtc,piper]>=0.0.44",
     "fastapi",
+    "httpx",
     "uvicorn",
     "python-dotenv",
     "loguru",
@@ -18,7 +19,6 @@ dependencies = [
     "asyncpg",
     "alembic",
     "pgvector",
-    "docling",
     "aioboto3",
     "aiofiles",
     "pyjwt",
@@ -30,13 +30,18 @@ dependencies = [
     "torch",
     "torchvision",
     "python-multipart",
-    "crawl4ai",
-    "trafilatura",
     "tavily-python",
     "pydantic",
     "pywhispercpp>=1.5,<2",
     "mlx-whisper>=0.4.3,<0.5",
     "moonshine-voice>=0.1,<0.2"
+]
+
+[project.optional-dependencies]
+rag-worker = [
+    "docling",
+    "crawl4ai",
+    "trafilatura",
 ]
 
 [dependency-groups]

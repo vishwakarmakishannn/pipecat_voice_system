@@ -26,6 +26,7 @@ def _clear_latency_settings(monkeypatch):
         "KOKORO_LOW_LATENCY",
         "KOKORO_WARMUP_ENABLED",
         "KOKORO_FIRST_CHUNK_CHARS",
+        "KOKORO_FIRST_CHUNK_MIN_WORDS",
         "KOKORO_CHUNK_CHARS",
         "KOKORO_MIN_CHUNK_WORDS",
         "KOKORO_INTRA_OP_THREADS",
@@ -54,6 +55,7 @@ def test_kokoro_config_defaults(monkeypatch, tmp_path):
     assert config.low_latency_enabled is True
     assert config.warmup_enabled is True
     assert config.first_chunk_chars == 12
+    assert config.first_chunk_min_words == 1
     assert config.chunk_chars == 80
     assert config.min_chunk_words == 2
     assert config.intra_op_threads == min(4, os.cpu_count() or 1)
@@ -135,6 +137,7 @@ def test_kokoro_runtime_validation_reports_missing_extra(monkeypatch):
         ("KOKORO_LOW_LATENCY", "sometimes"),
         ("KOKORO_WARMUP_ENABLED", "sometimes"),
         ("KOKORO_FIRST_CHUNK_CHARS", "7"),
+        ("KOKORO_FIRST_CHUNK_MIN_WORDS", "0"),
         ("KOKORO_CHUNK_CHARS", "501"),
         ("KOKORO_MIN_CHUNK_WORDS", "0"),
         ("KOKORO_INTRA_OP_THREADS", "0"),
@@ -191,6 +194,7 @@ def test_kokoro_builder_maps_configuration_without_loading_model(monkeypatch):
     assert captured["text_aggregation_mode"].value == "sentence"
     assert captured["low_latency_enabled"] is True
     assert captured["first_chunk_chars"] == 12
+    assert captured["first_chunk_min_words"] == 1
     assert captured["chunk_chars"] == 80
     assert captured["min_chunk_words"] == 2
 
@@ -203,6 +207,7 @@ async def _aggregate(aggregator, text):
 async def test_kokoro_aggregator_releases_short_first_phrase_before_sentence_end():
     aggregator = KokoroTextAggregator(
         first_chunk_chars=24,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=3,
     )
@@ -220,6 +225,7 @@ async def test_kokoro_aggregator_releases_short_first_phrase_before_sentence_end
 async def test_kokoro_aggregator_releases_punctuation_without_lookahead():
     aggregator = KokoroTextAggregator(
         first_chunk_chars=24,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=3,
     )
@@ -235,6 +241,7 @@ async def test_kokoro_aggregator_releases_punctuation_without_lookahead():
 async def test_kokoro_aggregator_flushes_remainder_and_resets_first_chunk():
     aggregator = KokoroTextAggregator(
         first_chunk_chars=12,
+        first_chunk_min_words=1,
         chunk_chars=40,
         min_chunk_words=2,
     )
@@ -252,6 +259,7 @@ async def test_kokoro_aggregator_flushes_remainder_and_resets_first_chunk():
 async def test_kokoro_aggregator_discards_partial_text_on_interruption():
     aggregator = KokoroTextAggregator(
         first_chunk_chars=24,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=3,
     )
@@ -284,6 +292,7 @@ def test_low_latency_service_installs_phrase_aggregator_only_for_sentence_mode(
         text_aggregation_mode=TextAggregationMode.SENTENCE,
         low_latency_enabled=True,
         first_chunk_chars=24,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=3,
     )
@@ -292,6 +301,7 @@ def test_low_latency_service_installs_phrase_aggregator_only_for_sentence_mode(
         text_aggregation_mode=TextAggregationMode.TOKEN,
         low_latency_enabled=True,
         first_chunk_chars=24,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=3,
     )
@@ -317,8 +327,25 @@ def test_low_latency_service_does_not_warm_runtime_during_construction(monkeypat
         text_aggregation_mode=TextAggregationMode.SENTENCE,
         low_latency_enabled=False,
         first_chunk_chars=24,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=3,
     )
 
     assert service._runtime is runtime
+
+
+@pytest.mark.anyio
+async def test_first_chunk_can_release_one_word_without_lowering_later_threshold():
+    aggregator = KokoroTextAggregator(
+        first_chunk_chars=8,
+        first_chunk_min_words=1,
+        chunk_chars=16,
+        min_chunk_words=2,
+    )
+
+    first = await _aggregate(aggregator, "Certainly continuing ")
+    second = await _aggregate(aggregator, "with more generated words ")
+
+    assert [chunk.text for chunk in first] == ["Certainly"]
+    assert all(len(chunk.text.split()) >= 2 for chunk in second)

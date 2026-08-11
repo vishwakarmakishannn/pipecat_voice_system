@@ -29,6 +29,17 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+from core.cors_config import configure_pipecat_allowed_origins
+from core.webrtc_compat import install_audio_only_cv2_shim
+
+# ``pipecat.runner.run`` installs the CORS middleware. Configure its parser
+# before importing any runner modules so there is exactly one authoritative
+# allow-list instead of a permissive outer middleware.
+configure_pipecat_allowed_origins()
+# The configured transports carry audio and data only. Prevent Pipecat's
+# unconditional video dependency import from loading a second FFmpeg build.
+install_audio_only_cv2_shim()
+
 from loguru import logger
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -71,7 +82,15 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TurnAnalyzerUserTurnStopStrategy
-from services.memory import build_memory_messages, build_turn_memory_context, hydrate_memory_bundle, load_session_bundle, save_conversation_message
+from services.memory import (
+    build_live_context_messages,
+    build_session_memory_context,
+    build_turn_memory_context,
+    hydrate_memory_bundle,
+    load_session_bundle,
+    save_conversation_message,
+    save_conversation_summary,
+)
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
 from services.rag import (
     build_rag_context_with_payload,
@@ -82,6 +101,14 @@ from services.rag import (
 from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from core.voice_config import load_endpointing_config, startup_greeting
 from core.voice_services import initialize_voice_runtime
+from core.prompt_config import load_system_prompt
+from core.context_summary import (
+    build_assistant_summary_params,
+    ContextMutationEpoch,
+    extract_live_conversation_summary,
+)
+from core.context_summary_config import load_voice_context_summary_config
+from providers.llm.context_summary import build_context_summary_service
 from core.audio_config import audio_input_sample_rate, audio_out_10ms_chunks, audio_output_sample_rate
 from core.turn_analyzer import (
     SharedModelSileroVADAnalyzer,
@@ -89,11 +116,12 @@ from core.turn_analyzer import (
     warm_silero_vad_model,
     warm_smart_turn_model,
 )
-from core.admission import voice_admission
+from core.admission import current_voice_slot_id, voice_admission
 from core.latency_observer import PipelineLatencyObserver, event_loop_lag_monitor
 from core.realtime_gate import realtime_turn_gate
-from tools.tavily import run_web_search, tavily_search
+from tools.tavily import tavily_search
 from tools.raise_issue import raise_issue
+from tools.datetime_tool import get_current_datetime
 
 from core.processors import (
     ConversationMemoryProcessor,
@@ -104,6 +132,7 @@ from core.processors import (
     TurnLatencyState,
     LatencyBoundaryProcessor,
     BoundedContextProcessor,
+    immutable_context_messages,
     ToolRoutingProcessor,
     transport_server_message,
 )
@@ -121,11 +150,22 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     """
     logger.info("Starting bot")
 
+    summary_config = load_voice_context_summary_config()
+
+    def build_session_llm(bundle):
+        return get_llm(
+            system_instruction=load_system_prompt(
+                session_memory_context=build_session_memory_context(bundle)
+            )
+        )
+
     # Constructors may load ONNX/Piper models or initialize provider clients.
     # They are independent, so keep them off the event loop and overlap them.
     (stt, tts, llm), memory_bundle = await initialize_voice_runtime(
         get_stt, get_tts, get_llm,
         load_session_bundle, runner_args.body,
+        session_hydrator=hydrate_memory_bundle,
+        session_llm_factory=build_session_llm,
     )
     # Warm OpenAI-compatible provider networking while the rest of the
     # session pipeline is assembled. This uses the same client instance that
@@ -136,7 +176,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         llm_warmup_task = asyncio.create_task(
             warm_connection(), name="voice-llm-connection-warmup"
         )
-    memory_messages = build_memory_messages(memory_bundle)
+    memory_messages = build_live_context_messages(memory_bundle)
     if memory_bundle:
         logger.info(
             f"Loaded memory for user={memory_bundle.user.id} "
@@ -157,37 +197,30 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         messages=memory_messages,
         tools=[]
     )
+    mutation_epoch = ContextMutationEpoch()
+    context_summary_llm = build_context_summary_service(
+        summary_config, lambda: mutation_epoch.value
+    )
+    if summary_config.enabled:
+        context_max_messages = summary_config.emergency_max_messages
+        context_max_chars = summary_config.emergency_max_chars
+        trim_status = "emergency_trimmed"
+    else:
+        context_max_messages = int(os.getenv("VOICE_CONTEXT_MAX_MESSAGES", "12"))
+        context_max_chars = int(os.getenv("VOICE_CONTEXT_MAX_CHARS", "6000"))
+        trim_status = "trimmed"
     context_window = BoundedContextProcessor(
         context,
-        protected_messages=memory_messages,
-        max_messages=int(os.getenv("VOICE_CONTEXT_MAX_MESSAGES", "12")),
-        max_chars=int(os.getenv("VOICE_CONTEXT_MAX_CHARS", "6000")),
+        protected_messages=immutable_context_messages(memory_messages),
+        max_messages=context_max_messages,
+        max_chars=context_max_chars,
+        mutation_epoch=mutation_epoch,
+        trim_status=trim_status,
         name="BoundedContext",
     )
-
-    async def install_optional_memory():
-        if not memory_bundle:
-            return
-        try:
-            hydrated = await hydrate_memory_bundle(memory_bundle)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Optional session memory hydration failed: {!r}", exc)
-            return
-        hydrated_messages = build_memory_messages(hydrated)
-        if not hydrated_messages:
-            return
-        if any(message.get("role") == "user" for message in context.messages if isinstance(message, dict)):
-            logger.info("Optional session memory arrived after first user turn; skipping foreground install")
-            return
-        context.messages[0:0] = hydrated_messages
-        context_window.protect_messages(hydrated_messages)
-        logger.info("Installed {} asynchronously hydrated memory messages", len(hydrated_messages))
-
-    memory_hydration_task = asyncio.create_task(install_optional_memory())
     latency_state = TurnLatencyState(
         session_id=getattr(runner_args, "session_id", None),
+        user_id=user_id,
         stt_provider=os.getenv("STT_PROVIDER", "deepgram").strip().lower(),
         stt_model=getattr(getattr(stt, "_settings", None), "model", None),
         llm_provider=os.getenv("LLM_PROVIDER", "google").strip().lower(),
@@ -203,15 +236,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         conversation_id,
         context,
         latency_state,
-        web_search=run_web_search,
         ready_corpus_check=user_has_ready_rag_corpus,
+        mutation_epoch=mutation_epoch,
         name="ContextRetrieval",
     )
     tool_router = ToolRoutingProcessor(
         context,
         search_tool=tavily_search,
         issue_tool=raise_issue,
-        retrieval=context_retrieval,
+        datetime_tool=get_current_datetime,
         latency_state=latency_state,
         name="ToolRouter",
     )
@@ -254,7 +287,30 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             ),
             user_turn_strategies=user_turn_strategies,
         ),
+        assistant_params=build_assistant_summary_params(
+            summary_config, context_summary_llm
+        ),
     )
+
+    @assistant_aggregator.event_handler("on_summary_applied")
+    async def persist_applied_context_summary(aggregator, event):
+        summary = extract_live_conversation_summary(context.messages)
+        logger.info(
+            "voice_context_summary status=applied original_messages={} "
+            "new_messages={} summarized_messages={}",
+            event.original_message_count,
+            event.new_message_count,
+            event.summarized_message_count,
+        )
+        if summary and conversation_id:
+            from core.task_queue import task_queue
+
+            task_queue.enqueue(
+                save_conversation_summary,
+                conversation_id,
+                summary,
+                key=conversation_id,
+            )
 
     @user_aggregator.event_handler("on_user_turn_started")
     async def reset_query_scoped_turn_state(aggregator, strategy):
@@ -369,19 +425,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         realtime_turn_gate.end(latency_state.priority_key)
         if llm_warmup_task and not llm_warmup_task.done():
             llm_warmup_task.cancel()
-        if not memory_hydration_task.done():
-            memory_hydration_task.cancel()
         await asyncio.gather(
-            memory_hydration_task,
             *(tuple([llm_warmup_task]) if llm_warmup_task else ()),
             return_exceptions=True,
         )
+        if context_summary_llm:
+            await context_summary_llm.close()
 
 
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point."""
 
-    if not await voice_admission.try_acquire():
+    slot_id = await voice_admission.try_acquire_slot()
+    if slot_id is None:
         logger.warning(
             "voice_admission status=rejected active={} limit={} session={}",
             voice_admission.active,
@@ -390,6 +446,7 @@ async def bot(runner_args: RunnerArguments):
         )
         raise RuntimeError("voice session capacity reached")
 
+    slot_token = current_voice_slot_id.set(slot_id)
     try:
         output_chunks = audio_out_10ms_chunks()
         input_sample_rate = audio_input_sample_rate()
@@ -414,7 +471,8 @@ async def bot(runner_args: RunnerArguments):
         transport = await create_transport(runner_args, transport_params)
         await run_bot(transport, runner_args)
     finally:
-        await voice_admission.release()
+        current_voice_slot_id.reset(slot_token)
+        await voice_admission.release(slot_id)
 
 
 from fastapi import APIRouter, HTTPException
@@ -463,20 +521,8 @@ if __name__ == "__main__":
     from core.logging_config import configure_nonblocking_logging
     configure_nonblocking_logging()
     from pipecat.runner.run import app, main
-    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
     import os
-
-    allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:80")
-    allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")]
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     @app.middleware("http")
     async def reject_over_capacity(request, call_next):

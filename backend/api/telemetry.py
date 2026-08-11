@@ -21,6 +21,7 @@ class VoiceLatencyTelemetry(BaseModel):
     turn_id: int = Field(ge=0)
     latency_stage: Literal["stt", "llm", "tts"] | None = None
     latency_complete: bool = False
+    measurement_source: Literal["server", "client"] = "client"
     category: Literal["direct", "rag", "tool"]
     basis: Literal["user_stopped", "final_stt"] | None = None
     with_tools: bool = False

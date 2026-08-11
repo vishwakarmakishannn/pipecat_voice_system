@@ -45,6 +45,7 @@ def test_voice_latency_schema_accepts_pipeline_stage_breakdown():
     assert telemetry.tts_latency_ms == 3089.2
     assert telemetry.latency_stage == "tts"
     assert telemetry.latency_complete is True
+    assert telemetry.measurement_source == "client"
 
 
 @pytest.mark.anyio
@@ -95,3 +96,30 @@ def test_latency_summary_separates_category_and_warmth():
     assert report["direct:warm"]["metrics"]["tts_latency_ms"]["p50"] == 200.0
     assert report["rag:cold"]["turns"] == 1
     assert percentile([], 0.5) is None
+
+
+def test_latency_summary_prefers_client_record_without_double_counting():
+    base = {
+        "user_id": 7,
+        "session_id": "session-a",
+        "turn_id": 3,
+        "category": "direct",
+        "llm_connection_warmed": True,
+        "answer_audio_ms": 400,
+    }
+    report = summarize_records(
+        [
+            {**base, "measurement_source": "server"},
+            {
+                **base,
+                "measurement_source": "client",
+                "user_stop_to_playback_ms": 475,
+            },
+        ]
+    )
+
+    assert report["direct:warm"]["turns"] == 1
+    assert (
+        report["direct:warm"]["metrics"]["user_stop_to_playback_ms"]["p50"]
+        == 475.0
+    )

@@ -1,19 +1,20 @@
 import asyncio
 import hashlib
+import http.client
 import ipaddress
 import math
 import uuid
 import os
 import re
 import socket
+import ssl
 import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 from loguru import logger
@@ -27,6 +28,7 @@ from core.rag_config import (
     RAG_CONTEXT_CHUNK_CHARS,
     RAG_LINK_CHUNK_CHARS,
     RAG_LINK_CHUNK_OVERLAP,
+    RAG_ALLOW_BROWSER_EXTRACTOR,
     RAG_LINK_EXTRACTOR,
     RAG_LINK_FALLBACK_EXTRACTOR,
     RAG_LINK_MAX_BYTES,
@@ -223,6 +225,8 @@ async def validate_public_http_url(url: str) -> str:
         raise ValueError("Only http and https links are supported")
     if not parsed.hostname:
         raise ValueError("Link must include a valid hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("Links containing credentials are not allowed")
 
     hostname = parsed.hostname.strip().lower()
     if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"):
@@ -230,8 +234,11 @@ async def validate_public_http_url(url: str) -> str:
 
     try:
         loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = await loop.getaddrinfo(
+            hostname, port, type=socket.SOCK_STREAM
+        )
+    except (socket.gaierror, ValueError) as exc:
         raise ValueError("Could not resolve link hostname") from exc
 
     addresses = {info[4][0] for info in infos}
@@ -251,16 +258,141 @@ def _hostname_label(url: str) -> str:
     return parsed.hostname or url
 
 
-def _robots_allowed(url: str) -> bool:
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that preserves hostname verification while pinning an IP."""
+
+    def __init__(self, hostname: str, address: str, port: int, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_address, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=self.host
+        )
+
+
+def _resolve_public_addresses(url: str) -> tuple[Any, int, list[str]]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only public http and https links are supported")
+    if parsed.username or parsed.password:
+        raise ValueError("Links containing credentials are not allowed")
+    hostname = parsed.hostname.strip().lower()
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(
+        ".localhost"
+    ):
+        raise ValueError("Local links are not allowed")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = socket.getaddrinfo(
+            hostname, port, type=socket.SOCK_STREAM
+        )
+    except (socket.gaierror, ValueError) as exc:
+        raise ValueError("Could not resolve link hostname") from exc
+    addresses = sorted({info[4][0] for info in infos})
+    if not addresses or any(not _is_public_ip(address) for address in addresses):
+        raise ValueError("Links to private or local networks are not allowed")
+    return parsed, port, addresses
+
+
+def _request_pinned(url: str, max_bytes: int) -> tuple[int, Any, bytes]:
+    parsed, port, addresses = _resolve_public_addresses(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    host_header = parsed.hostname or ""
+    default_port = 443 if parsed.scheme == "https" else 80
+    if port != default_port:
+        host_header = f"{host_header}:{port}"
+
+    last_error: Exception | None = None
+    for address in addresses:
+        connection: http.client.HTTPConnection
+        if parsed.scheme == "https":
+            connection = _PinnedHTTPSConnection(
+                parsed.hostname or "", address, port, RAG_LINK_TIMEOUT_SECONDS
+            )
+        else:
+            connection = http.client.HTTPConnection(
+                address, port=port, timeout=RAG_LINK_TIMEOUT_SECONDS
+            )
+        try:
+            connection.request(
+                "GET",
+                path,
+                headers={
+                    "Host": host_header,
+                    "User-Agent": RAG_LINK_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,text/plain;q=0.8",
+                    "Connection": "close",
+                },
+            )
+            response = connection.getresponse()
+            data = response.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise ValueError("Link content is too large")
+            return response.status, response.headers, data
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            connection.close()
+    raise ValueError("Could not safely fetch link") from last_error
+
+
+def _fetch_bytes(
+    url: str,
+    *,
+    max_bytes: int,
+    accepted_content_types: tuple[str, ...] | None = None,
+    max_redirects: int = 5,
+) -> tuple[bytes, str, str]:
+    current_url = url
+    for redirect_count in range(max_redirects + 1):
+        status, headers, data = _request_pinned(current_url, max_bytes)
+        if status in {301, 302, 303, 307, 308}:
+            if redirect_count >= max_redirects:
+                raise ValueError("Link redirected too many times")
+            location = headers.get("location")
+            if not location:
+                raise ValueError("Link returned an invalid redirect")
+            current_url = urljoin(current_url, location)
+            # Resolve and validate before the next request. The actual request
+            # repeats this check and connects to one of these exact public IPs.
+            _resolve_public_addresses(current_url)
+            continue
+        if not 200 <= status < 300:
+            raise ValueError(f"Link returned HTTP {status}")
+        content_type = (headers.get("content-type") or "").lower()
+        if accepted_content_types and not any(
+            expected in content_type for expected in accepted_content_types
+        ):
+            raise ValueError("Link returned an unsupported content type")
+        charset = headers.get_content_charset() or "utf-8"
+        return data, current_url, charset
+    raise ValueError("Link redirected too many times")
+
+
+async def _robots_allowed(url: str) -> bool:
     if not RAG_LINK_RESPECT_ROBOTS:
         return True
-
-    robots = RobotFileParser()
-    robots.set_url(f"{_origin(url)}/robots.txt")
     try:
-        robots.read()
+        data, _final_url, charset = await asyncio.to_thread(
+            _fetch_bytes,
+            f"{_origin(url)}/robots.txt",
+            max_bytes=512_000,
+            accepted_content_types=None,
+            max_redirects=3,
+        )
     except Exception:
         return True
+    robots = RobotFileParser()
+    robots.set_url(f"{_origin(url)}/robots.txt")
+    robots.parse(data.decode(charset, errors="replace").splitlines())
     return robots.can_fetch(RAG_LINK_USER_AGENT, url)
 
 
@@ -495,23 +627,13 @@ async def _extract_link_with_crawl4ai(url: str) -> ExtractedLink:
 
 
 async def _fetch_html(url: str) -> tuple[str, str]:
-    request = Request(url, headers={"User-Agent": RAG_LINK_USER_AGENT})
-    
-    def do_request():
-        with urlopen(request, timeout=RAG_LINK_TIMEOUT_SECONDS) as response:
-            final_url = response.geturl()
-            content_type = response.headers.get("content-type", "")
-            if "text/html" not in content_type and "application/xhtml" not in content_type:
-                raise ValueError("Link did not return an HTML page")
-            data = response.read(RAG_LINK_MAX_BYTES + 1)
-            if len(data) > RAG_LINK_MAX_BYTES:
-                raise ValueError("Link content is too large")
-            charset = response.headers.get_content_charset() or "utf-8"
-        return data.decode(charset, errors="replace"), final_url
-    
-    data, final_url = await asyncio.to_thread(do_request)
-    await validate_public_http_url(final_url)
-    return data, final_url
+    data, final_url, charset = await asyncio.to_thread(
+        _fetch_bytes,
+        url,
+        max_bytes=RAG_LINK_MAX_BYTES,
+        accepted_content_types=("text/html", "application/xhtml"),
+    )
+    return data.decode(charset, errors="replace"), final_url
 
 
 async def _extract_link_with_trafilatura(url: str) -> ExtractedLink:
@@ -540,9 +662,11 @@ async def _extract_link_with_trafilatura(url: str) -> ExtractedLink:
 
 async def extract_link(url: str) -> ExtractedLink:
     validated_url = await validate_public_http_url(url)
+    if not await _robots_allowed(validated_url):
+        raise ValueError("Link ingestion is disallowed by robots.txt")
 
     errors = []
-    if RAG_LINK_EXTRACTOR == "crawl4ai":
+    if RAG_LINK_EXTRACTOR == "crawl4ai" and RAG_ALLOW_BROWSER_EXTRACTOR:
         try:
             extracted = await _extract_link_with_crawl4ai(validated_url)
             if len(extracted.markdown) >= RAG_LINK_MIN_CHARS:
@@ -551,7 +675,13 @@ async def extract_link(url: str) -> ExtractedLink:
         except Exception as exc:
             errors.append(f"Crawl4AI: {exc}")
 
-    if RAG_LINK_FALLBACK_EXTRACTOR == "trafilatura":
+    if RAG_LINK_EXTRACTOR == "crawl4ai" and not RAG_ALLOW_BROWSER_EXTRACTOR:
+        errors.append("Crawl4AI browser extraction is disabled for untrusted URLs")
+
+    if (
+        RAG_LINK_EXTRACTOR == "trafilatura"
+        or RAG_LINK_FALLBACK_EXTRACTOR == "trafilatura"
+    ):
         try:
             extracted = await _extract_link_with_trafilatura(validated_url)
             if len(extracted.markdown) >= RAG_LINK_MIN_CHARS:

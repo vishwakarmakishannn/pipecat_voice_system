@@ -6,10 +6,14 @@ from services.memory import (
     MemoryBundle,
     build_memory_chunk,
     build_memory_messages,
+    build_live_context_messages,
+    build_session_memory_context,
     build_turn_memory_context,
     classify_memory_events,
     message_to_llm,
     is_memory_fact_candidate,
+    maintain_memory_chunks_if_needed,
+    save_conversation_summary,
 )
 import services.memory as memory_service
 from core.models import Conversation, MemoryChunk, Message, User, UserMemory
@@ -127,7 +131,7 @@ def test_build_memory_messages_ignores_invalid_name_memory():
     assert build_memory_messages(bundle) == []
 
 
-def test_memory_prompt_deduplicates_summary_and_recent_content(monkeypatch):
+def test_summary_and_overlapping_recent_turn_use_separate_context_layers(monkeypatch):
     bundle = MemoryBundle(
         user=User(id=1, username="kishan", password_hash="x"),
         primary_conversation=Conversation(id=10, user_id=1, title="Chat", summary=""),
@@ -142,11 +146,12 @@ def test_memory_prompt_deduplicates_summary_and_recent_content(monkeypatch):
 
     messages = build_memory_messages(bundle)
 
-    assert not any(
+    assert any(
         message.get("content") == "I prefer jasmine tea every morning."
         for message in messages
     )
     assert any("I will remember" in message.get("content", "") for message in messages)
+    assert "jasmine tea" in build_session_memory_context(bundle)
 
 
 def test_memory_prompt_keeps_latest_turn_within_shared_budget(monkeypatch):
@@ -181,7 +186,7 @@ def test_message_to_llm_maps_supported_roles_only():
     assert message_to_llm(Message(role="RagCall", content="{}")) is None
 
 
-def test_build_memory_messages_includes_typed_facts_summary_and_recent_transcript():
+def test_build_memory_messages_is_safe_alias_for_recent_live_dialogue():
     bundle = MemoryBundle(
         user=User(id=1, username="kishan", password_hash="x"),
         primary_conversation=Conversation(id=10, user_id=1, title="Old chat", summary="Discussed memory."),
@@ -199,19 +204,13 @@ def test_build_memory_messages_includes_typed_facts_summary_and_recent_transcrip
 
     messages = build_memory_messages(bundle)
 
-    assert messages[0]["role"] == "developer"
-    assert "real_name: Kishan" in messages[0]["content"]
-    assert "preference.likes: football" in messages[0]["content"]
-    assert "preference.likes: apple" in messages[0]["content"]
-    assert messages[1]["role"] == "developer"
-    assert "Discussed memory." in messages[1]["content"]
-    assert messages[-2:] == [
+    assert messages == [
         {"role": "user", "content": "What did we discuss?"},
         {"role": "assistant", "content": "Memory implementation."},
     ]
 
 
-def test_build_memory_messages_includes_prior_context_as_secondary():
+def test_build_memory_messages_does_not_eagerly_install_prior_context():
     bundle = MemoryBundle(
         user=User(id=1, username="kishan", password_hash="x"),
         primary_conversation=Conversation(id=11, user_id=1, title="New conversation", summary=""),
@@ -232,10 +231,134 @@ def test_build_memory_messages_includes_prior_context_as_secondary():
 
     messages = build_memory_messages(bundle)
 
-    assert len(messages) == 1
-    assert messages[0]["role"] == "developer"
-    assert "Recent prior conversation context" in messages[0]["content"]
-    assert "Explain AI in one line." in messages[0]["content"]
+    assert messages == []
+
+
+def test_session_instruction_memory_contains_stable_data_not_recent_dialogue():
+    bundle = MemoryBundle(
+        user=User(id=1, username="kishan", password_hash="x"),
+        primary_conversation=Conversation(id=10, user_id=1, title="Chat"),
+        facts=[
+            UserMemory(
+                key="preferred_name",
+                value="Kishan",
+                status="active",
+                fact_type="profile",
+            )
+        ],
+        primary_summary="The user is comparing phones.",
+        primary_recent_messages=[Message(role="You", content="Latest question")],
+    )
+
+    memory_context = build_session_memory_context(bundle)
+
+    assert "preferred_name: Kishan" in memory_context
+    assert "The user is comparing phones." in memory_context
+    assert "Latest question" not in memory_context
+
+
+def test_live_context_contains_only_recent_primary_dialogue():
+    bundle = MemoryBundle(
+        user=User(id=1, username="kishan", password_hash="x"),
+        primary_conversation=Conversation(id=11, user_id=1, title="Chat"),
+        facts=[
+            UserMemory(
+                key="likes", value="football", status="active", fact_type="preference"
+            )
+        ],
+        primary_summary="Old canonical summary.",
+        primary_recent_messages=[
+            Message(role="You", content="Question"),
+            Message(role="Aura", content="Answer"),
+        ],
+        prior_conversation=Conversation(id=10, user_id=1, title="Older"),
+        prior_recent_messages=[Message(role="You", content="Prior chat")],
+    )
+
+    assert build_live_context_messages(bundle) == [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "Answer"},
+    ]
+
+
+@pytest.mark.anyio
+async def test_chunk_maintenance_no_longer_generates_competing_summary(
+    monkeypatch,
+):
+    recent = [
+        Message(id=index, role="You" if index % 2 else "Aura", content=str(index))
+        for index in range(1, 9)
+    ]
+
+    class CountResult:
+        def scalar_one(self):
+            return 16
+
+    class MessagesResult:
+        class Scalars:
+            @staticmethod
+            def all():
+                return list(reversed(recent))
+
+        def scalars(self):
+            return self.Scalars()
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, _statement):
+            self.calls += 1
+            return CountResult() if self.calls == 1 else MessagesResult()
+
+    stored = []
+
+    async def store(_db, _conversation, messages):
+        stored.append(messages)
+
+    monkeypatch.setattr(memory_service, "store_memory_chunk", store)
+    conversation = Conversation(id=10, user_id=1, summary="canonical")
+
+    await maintain_memory_chunks_if_needed(Session(), conversation)
+
+    assert conversation.summary == "canonical"
+    assert stored == [recent]
+
+
+@pytest.mark.anyio
+async def test_applied_live_summary_updates_canonical_conversation(monkeypatch):
+    conversation = Conversation(id=10, user_id=1, summary="old")
+
+    class Result:
+        class Scalars:
+            @staticmethod
+            def first():
+                return conversation
+
+        def scalars(self):
+            return self.Scalars()
+
+    class Session:
+        committed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            self.committed = True
+
+    session = Session()
+    monkeypatch.setattr(memory_service, "AsyncSessionLocal", lambda: session)
+
+    assert await save_conversation_summary(10, " new canonical summary ") is True
+    assert conversation.summary == "new canonical summary"
+    assert session.committed is True
 
 
 @pytest.mark.anyio
@@ -307,7 +430,7 @@ async def test_memory_text_inference_uses_only_selected_llm_provider(monkeypatch
     groq_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions("groq")))
     openai_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions("openai")))
 
-    monkeypatch.setenv("LLM_PROVIDER", provider)
+    monkeypatch.setenv("MEMORY_LLM_PROVIDER", provider)
     monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
     monkeypatch.setenv("GROQ_API_KEY", "groq-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
@@ -349,7 +472,7 @@ async def test_memory_text_inference_reuses_local_llm_runtime(monkeypatch):
         ),
     )
 
-    monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setenv("MEMORY_LLM_PROVIDER", "local")
     monkeypatch.setattr(memory_service, "_get_local_memory_runtime", lambda: runtime)
     monkeypatch.setattr(memory_service, "_memory_llm_backoff_until", 0.0)
 
@@ -366,6 +489,33 @@ async def test_memory_text_inference_reuses_local_llm_runtime(monkeypatch):
             "extra_body": config.extra_body,
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_memory_llm_can_be_decoupled_from_local_voice_provider(monkeypatch):
+    calls = []
+
+    class Completions:
+        async def create(self, **_kwargs):
+            calls.append("groq")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="remote"))]
+            )
+
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setenv("MEMORY_LLM_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    monkeypatch.setattr(
+        memory_service,
+        "_get_groq_client",
+        lambda: SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        ),
+    )
+    monkeypatch.setattr(memory_service, "_memory_llm_backoff_until", 0.0)
+
+    assert await memory_service._generate_text_with_memory_llm("prompt") == "remote"
+    assert calls == ["groq"]
 
 
 @pytest.mark.anyio

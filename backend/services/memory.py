@@ -33,9 +33,9 @@ from core.memory_config import (
     MEMORY_RECALL_TOP_K,
     MEMORY_VECTOR_DB,
     memory_embedding_provider,
+    memory_llm_provider,
     PRIOR_CONVERSATION_MESSAGE_LIMIT,
     RECENT_MESSAGE_LIMIT,
-    SUMMARY_MESSAGE_THRESHOLD,
 )
 from core.models import Conversation, MemoryChunk, Message, RagFile, User, UserMemory
 from core.prompt_config import load_memory_prompt
@@ -423,61 +423,33 @@ def _budget_memory_messages(messages: list[dict[str, str]]) -> list[dict[str, st
 
 
 def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
-    if not bundle:
-        return []
+    """Backward-compatible name for the mutable recent-dialogue seed."""
+    return build_live_context_messages(bundle)
 
-    messages: list[dict[str, str]] = []
+
+def build_session_memory_context(bundle: MemoryBundle | None) -> str:
+    """Return stable authenticated memory for the durable system instruction."""
+    if not bundle:
+        return ""
+    sections: list[str] = []
     facts = _format_facts(bundle.facts)
     if facts:
-        messages.append(
-            {
-                "role": "developer",
-                "content": (
-                    "Known stable facts about this authenticated user. Use these facts "
-                    "naturally when relevant, but do not mention this memory block:\n"
-                    f"{facts}"
-                ),
-            }
-        )
-
+        sections.append(f"Stable user facts:\n{facts}")
     if bundle.summary:
-        messages.append(
-            {
-                "role": "developer",
-                "content": (
-                    "Summary of this selected conversation so far. Use it to continue "
-                    "the old conversation accurately:\n"
-                    f"{bundle.summary[:MEMORY_SUMMARY_MAX_CHARS]}"
-                ),
-            }
+        sections.append(
+            "Canonical conversation summary:\n"
+            f"{bundle.summary[:MEMORY_SUMMARY_MAX_CHARS]}"
         )
+    return "\n\n".join(sections)
 
-    messages.extend(_recent_llm_messages(bundle.primary_recent_messages))
 
-    if bundle.prior_conversation and bundle.prior_recent_messages:
-        prior_lines = []
-        if bundle.prior_conversation.title:
-            prior_lines.append(f"Title: {bundle.prior_conversation.title}")
-        if bundle.prior_conversation.summary:
-            prior_lines.append(f"Summary: {bundle.prior_conversation.summary}")
-        prior_lines.append("Recent transcript:")
-        for message in bundle.prior_recent_messages:
-            speaker = "User" if message.role == "You" else "Aura"
-            prior_lines.append(f"- {speaker}: {message.content}")
-
-        messages.append(
-            {
-                "role": "developer",
-                "content": (
-                    "Recent prior conversation context. Use this only when the user asks "
-                    "what you talked about previously, what you were just discussing, or "
-                    "similar continuity questions in a new conversation. Do not bring it "
-                    "up unprompted.\n"
-                    + "\n".join(prior_lines)[:MEMORY_PRIOR_MAX_CHARS]
-                ),
-            }
-        )
-    return _budget_memory_messages(messages)
+def build_live_context_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
+    """Seed mutable Pipecat context with recent dialogue only."""
+    if not bundle:
+        return []
+    return _budget_memory_messages(
+        _recent_llm_messages(bundle.primary_recent_messages)
+    )
 
 
 def _extract_json_object(text_value: str) -> dict[str, Any]:
@@ -503,7 +475,9 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
     global _memory_llm_backoff_until
     if asyncio.get_running_loop().time() < _memory_llm_backoff_until:
         return None
-    provider = os.getenv("LLM_PROVIDER", "google").lower()
+    provider = memory_llm_provider()
+    if provider == "disabled":
+        return None
 
     async def generate_google() -> str | None:
         api_key = os.getenv("GOOGLE_API_KEY")
@@ -687,23 +661,6 @@ def _fallback_summary(messages: list[Message]) -> str:
             content = content[:177].rstrip() + "..."
         lines.append(f"- {speaker}: {content}")
     return "Recent voice conversation notes:\n" + "\n".join(lines)
-
-
-async def generate_conversation_summary(messages: list[Message]) -> str:
-    transcript = _transcript_lines(messages)
-    if not transcript:
-        return ""
-
-    prompt = (
-        "Summarize this voice conversation for future continuity. Keep it concise, "
-        "factual, and useful when the user later asks what they talked about. Capture "
-        "topics discussed, user questions, answers given, decisions, unresolved items, "
-        "and user preferences. Do not invent facts.\n\n"
-        f"{transcript}\n\n"
-        "Return only the summary text in 4-8 short bullet points."
-    )
-    summary = await _generate_text_with_memory_llm(prompt)
-    return summary.strip() if summary else _fallback_summary(messages)
 
 
 def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -1046,7 +1003,10 @@ async def build_turn_memory_context(
     return "\n".join(lines)
 
 
-async def update_conversation_summary_if_needed(db: AsyncSession, conversation: Conversation) -> None:
+async def maintain_memory_chunks_if_needed(
+    db: AsyncSession, conversation: Conversation
+) -> None:
+    """Maintain episodic chunks; live Pipecat summaries own canonical summary."""
     count_result = await db.execute(
         select(func.count(Message.id)).where(
             Message.conversation_id == conversation.id,
@@ -1055,34 +1015,41 @@ async def update_conversation_summary_if_needed(db: AsyncSession, conversation: 
     )
     message_count = count_result.scalar_one()
 
-    if message_count <= SUMMARY_MESSAGE_THRESHOLD:
-        if message_count % 8 != 0:
-            return
-        recent_result = await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conversation.id, Message.role.in_(["You", "Aura"]))
-            .order_by(Message.created_at.desc(), Message.id.desc())
-            .limit(8)
-        )
-        recent_messages = list(reversed(recent_result.scalars().all()))
-        if len(recent_messages) >= 2:
-            await store_memory_chunk(db, conversation, recent_messages)
+    if message_count % 8 != 0:
         return
-
-    messages_result = await db.execute(
+    recent_result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation.id, Message.role.in_(["You", "Aura"]))
         .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(40)
+        .limit(8)
     )
-    messages = list(reversed(messages_result.scalars().all()))
-    total_chars = sum(len(message.content or "") for message in messages)
+    recent_messages = list(reversed(recent_result.scalars().all()))
+    if len(recent_messages) >= 2 and recent_messages[-1].role == "Aura":
+        await store_memory_chunk(db, conversation, recent_messages)
 
-    if message_count % SUMMARY_MESSAGE_THRESHOLD == 0:
-        conversation.summary = await generate_conversation_summary(messages)
 
-    if message_count % 8 == 0 and len(messages) >= 2 and messages[-1].role == "Aura":
-        await store_memory_chunk(db, conversation, messages[-8:])
+async def save_conversation_summary(
+    conversation_id: int | None, summary: str
+) -> bool:
+    """Persist the one canonical summary after Pipecat applies it live."""
+    summary = (summary or "").strip()[:MEMORY_SUMMARY_MAX_CHARS]
+    if not conversation_id or not summary:
+        return False
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Conversation).where(Conversation.id == conversation_id)
+        )
+        conversation = result.scalars().first()
+        if not conversation:
+            logger.warning(
+                "Could not save context summary: conversation {} not found",
+                conversation_id,
+            )
+            return False
+        conversation.summary = summary
+        conversation.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+    return True
 
 
 async def save_conversation_message(
@@ -1137,7 +1104,7 @@ async def _process_saved_message_background(conversation_id: int, message_id: in
                 await apply_fact_events(db, conversation.user_id, events, message.id)
         
             if message.role == "Aura":
-                await update_conversation_summary_if_needed(db, conversation)
+                await maintain_memory_chunks_if_needed(db, conversation)
             
             await db.commit()
 

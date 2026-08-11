@@ -29,4 +29,4 @@ def timeout_recovery_text() -> str:
 
 
 def total_timeout_seconds() -> float:
-    return _bounded_seconds("VOICE_LLM_TOTAL_TIMEOUT_SECONDS", 20.0, 1.0, 120.0)
+    return _bounded_seconds("VOICE_LLM_TOTAL_TIMEOUT_SECONDS", 30.0, 1.0, 120.0)

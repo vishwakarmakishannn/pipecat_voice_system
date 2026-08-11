@@ -262,13 +262,13 @@ class LatencyBoundGroqLLMService(GroqLLMService):
             started_at=started,
         )
 
-def get_groq_llm():
+def get_groq_llm(*, system_instruction: str | None = None):
     model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
     return LatencyBoundGroqLLMService(
         api_key=os.getenv("GROQ_API_KEY"),
         settings=GroqLLMSettings(
             model=model,
-            system_instruction=load_system_prompt(),
+            system_instruction=system_instruction or load_system_prompt(),
             extra=_groq_completion_settings(model),
         ),
         function_call_timeout_secs=tool_timeout_seconds(),

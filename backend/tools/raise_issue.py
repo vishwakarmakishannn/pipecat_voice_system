@@ -1,6 +1,7 @@
 import re
 import asyncio
 from pipecat.frames.frames import OutputTransportMessageFrame, TTSSpeakFrame
+from pipecat.processors.aggregators.llm_context import NOT_GIVEN
 from pipecat.services.llm_service import FunctionCallParams
 from core.database import VoiceSessionLocal
 from core.models import Issue
@@ -62,6 +63,10 @@ async def _publish_tool_event(
 
 async def _return_tool_result(params: FunctionCallParams, result: dict) -> None:
     await _publish_tool_event(params, "completed", result)
+    context = getattr(params, "context", None)
+    if context is not None:
+        context.set_tools([])
+        context.set_tool_choice(NOT_GIVEN)
     await params.result_callback(result)
 
 

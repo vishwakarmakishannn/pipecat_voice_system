@@ -10,10 +10,15 @@ from loguru import logger
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 import httpx
 
+from core.prompt_config import load_system_prompt
+from tools.datetime_tool import openai_datetime_tool_schema
+from tools.tavily import openai_tavily_tool_schema
+
 from .config import LocalLLMConfig, load_local_llm_config
 
 
 ClientFactory = Callable[[LocalLLMConfig], Any]
+SlotProbe = Callable[[LocalLLMConfig], Any]
 
 
 def _create_client(config: LocalLLMConfig) -> AsyncOpenAI:
@@ -30,6 +35,17 @@ def _create_client(config: LocalLLMConfig) -> AsyncOpenAI:
     )
 
 
+async def _probe_server_slots(config: LocalLLMConfig) -> int:
+    server_root = config.base_url.removesuffix("/v1")
+    async with httpx.AsyncClient(timeout=config.warmup_timeout_seconds) as client:
+        response = await client.get(f"{server_root}/slots")
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError("llama.cpp /slots returned an invalid payload")
+    return len(payload)
+
+
 class LocalLLMRuntime:
     """Own the shared async client used by all local voice sessions."""
 
@@ -38,9 +54,11 @@ class LocalLLMRuntime:
         config: LocalLLMConfig,
         *,
         client_factory: ClientFactory = _create_client,
+        slot_probe: SlotProbe = _probe_server_slots,
     ):
         self.config = config
         self.client = client_factory(config)
+        self._slot_probe = slot_probe
         self._warm_lock = asyncio.Lock()
         self._warmed = False
         self._closed = False
@@ -75,19 +93,48 @@ class LocalLLMRuntime:
                         f"Local LLM model {self.config.model!r} is unavailable; "
                         f"server reported {available!r}"
                     )
-                await self.client.chat.completions.create(
-                    model=self.config.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Reply with only OK.",
-                        },
-                        {"role": "user", "content": "Ready?"},
-                    ],
-                    stream=False,
-                    temperature=0.0,
-                    max_tokens=4,
-                    extra_body=self.config.extra_body,
+                if self.config.validate_server_slots:
+                    slot_count = await self._slot_probe(self.config)
+                    if slot_count < self.config.max_concurrent_sessions:
+                        raise RuntimeError(
+                            "llama.cpp has fewer parallel slots than the backend "
+                            f"admits: server={slot_count}, "
+                            f"backend={self.config.max_concurrent_sessions}"
+                        )
+                warmup_messages = [
+                    {
+                        "role": "system",
+                        "content": load_system_prompt(),
+                    },
+                    {
+                        "role": "user",
+                        "content": "Reply with only OK to confirm readiness.",
+                    },
+                ]
+
+                async def warm_slot() -> None:
+                    await self.client.chat.completions.create(
+                        model=self.config.model,
+                        messages=warmup_messages,
+                        stream=False,
+                        temperature=0.0,
+                        max_tokens=4,
+                        tools=[
+                            openai_datetime_tool_schema(),
+                            openai_tavily_tool_schema(),
+                        ],
+                        tool_choice="auto",
+                        extra_body=self.config.extra_body,
+                    )
+
+                # Prompt caches are slot-local in llama.cpp. Keep requests in
+                # flight together so every admitted parallel slot receives
+                # the production prefix before voice traffic begins.
+                await asyncio.gather(
+                    *(
+                        warm_slot()
+                        for _ in range(self.config.max_concurrent_sessions)
+                    )
                 )
 
             try:

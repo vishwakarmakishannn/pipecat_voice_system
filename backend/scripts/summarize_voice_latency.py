@@ -30,6 +30,27 @@ def percentile(values: list[float], quantile: float) -> float | None:
 
 
 def summarize_records(records: list[dict]) -> dict:
+    # The server writes a guaranteed generation-side record; a browser may
+    # later add actual playback/WebRTC metrics for the same turn. Prefer that
+    # richer client record without counting the turn twice.
+    deduplicated: dict[tuple, dict] = {}
+    unkeyed: list[dict] = []
+    for record in records:
+        turn_id = record.get("turn_id")
+        session_id = record.get("session_id")
+        if turn_id is None or session_id is None:
+            unkeyed.append(record)
+            continue
+        key = (record.get("user_id"), session_id, turn_id)
+        current = deduplicated.get(key)
+        source_rank = 2 if record.get("measurement_source") == "client" else 1
+        current_rank = (
+            2 if current and current.get("measurement_source") == "client" else 1
+        )
+        if current is None or source_rank >= current_rank:
+            deduplicated[key] = record
+    records = [*unkeyed, *deduplicated.values()]
+
     groups: dict[str, list[dict]] = defaultdict(list)
     for record in records:
         category = record.get("category", "unknown")

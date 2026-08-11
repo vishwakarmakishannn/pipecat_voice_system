@@ -18,6 +18,7 @@ class LocalLLMConfig:
     max_tokens: int
     warmup_timeout_seconds: float
     max_concurrent_sessions: int
+    validate_server_slots: bool
 
     @property
     def extra_body(self) -> dict:
@@ -26,6 +27,7 @@ class LocalLLMConfig:
             "min_p": self.min_p,
             "chat_template_kwargs": {"enable_thinking": False},
             "reasoning_effort": "none",
+            "cache_prompt": True,
         }
 
 
@@ -70,6 +72,15 @@ def _bounded_int(
             f"{name} must be between {minimum} and {maximum}, got {value}"
         )
     return value
+
+
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
 
 
 def _base_url() -> str:
@@ -120,7 +131,7 @@ def load_local_llm_config() -> LocalLLMConfig:
             -2.0,
             2.0,
         ),
-        max_tokens=_bounded_int("LOCAL_LLM_MAX_TOKENS", 192, 1, 2048),
+        max_tokens=_bounded_int("LOCAL_LLM_MAX_TOKENS", 512, 1, 2048),
         warmup_timeout_seconds=_bounded_float(
             "LOCAL_LLM_WARMUP_TIMEOUT_SECONDS",
             30.0,
@@ -128,4 +139,5 @@ def load_local_llm_config() -> LocalLLMConfig:
             300.0,
         ),
         max_concurrent_sessions=max_concurrent_sessions,
+        validate_server_slots=_boolean("LOCAL_LLM_VALIDATE_SERVER_SLOTS", True),
     )

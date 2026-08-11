@@ -29,7 +29,7 @@ LOCAL_LLM_TOP_P=0.8
 LOCAL_LLM_TOP_K=20
 LOCAL_LLM_MIN_P=0.0
 LOCAL_LLM_PRESENCE_PENALTY=0.0
-LOCAL_LLM_MAX_TOKENS=192
+LOCAL_LLM_MAX_TOKENS=512
 LOCAL_LLM_WARMUP_TIMEOUT_SECONDS=30
 LOCAL_LLM_MAX_CONCURRENT_SESSIONS=2
 ```
@@ -41,7 +41,54 @@ a cloud LLM. The process shares one HTTP client across at most two admitted
 voice sessions.
 
 Set `LLM_PROVIDER=groq`, `google`, or `openai` to restore a cloud provider.
+When voice uses the local provider, keep deferred memory classification off the
+voice model with `MEMORY_LLM_PROVIDER=groq` (or `google`/`openai`). Set it to
+`local` only when sharing llama.cpp capacity is intentional.
 Those providers retain their existing credential and model settings.
+
+Set the assistant's default IANA timezone independently of the selected LLM:
+
+```dotenv
+VOICE_TIMEZONE=Asia/Kolkata
+```
+
+The backend injects the current date and timezone once into each session's
+durable system instruction. Exact clock
+time, timezone conversion, and deadline questions use the always-available
+`get_current_datetime` tool so changing seconds do not invalidate prompt-cache
+prefixes. `tavily_search` is also advertised on every ordinary turn; both
+read-only tools use automatic semantic selection rather than phrase matching.
+The write-capable complaint tool remains scoped to its confirmation workflow.
+
+## Live conversation context
+
+Live sessions use Pipecat's automatic context summarization instead of hard
+dropping older turns. Stable authenticated facts and the canonical database
+summary are placed in the session system instruction; only recent dialogue is
+seeded into mutable context. A dedicated Groq model summarizes older clean
+user/assistant turns, while raw tool results and query-scoped RAG/memory blocks
+are excluded. Successfully applied summaries update the same canonical
+`Conversation.summary` field used when a session is reopened.
+
+```dotenv
+VOICE_CONTEXT_SUMMARIZATION_ENABLED=true
+VOICE_CONTEXT_SUMMARY_MAX_TOKENS=3000
+VOICE_CONTEXT_SUMMARY_MAX_MESSAGES=20
+VOICE_CONTEXT_SUMMARY_TARGET_TOKENS=900
+VOICE_CONTEXT_SUMMARY_KEEP_MESSAGES=8
+VOICE_CONTEXT_SUMMARY_TIMEOUT_SECONDS=6
+VOICE_CONTEXT_SUMMARY_RETRY_COOLDOWN_SECONDS=30
+VOICE_CONTEXT_EMERGENCY_MAX_MESSAGES=40
+VOICE_CONTEXT_EMERGENCY_MAX_CHARS=24000
+GROQ_CONTEXT_SUMMARY_MODEL=llama-3.1-8b-instant
+```
+
+When summarization is enabled, `GROQ_API_KEY` is required even if the live
+voice model is Google, OpenAI, or local. The summarizer never falls back to the
+latency-sensitive voice model. `VOICE_CONTEXT_MAX_MESSAGES=12` and
+`VOICE_CONTEXT_MAX_CHARS=6000` remain the legacy bounds used only when the
+feature flag is disabled. The larger emergency bounds protect a live session
+if Groq is temporarily unavailable; failed attempts observe a retry cooldown.
 
 ## Speech-to-text providers
 
@@ -144,6 +191,7 @@ The latency controls can be tuned or disabled:
 KOKORO_LOW_LATENCY=true
 KOKORO_WARMUP_ENABLED=true
 KOKORO_FIRST_CHUNK_CHARS=12
+KOKORO_FIRST_CHUNK_MIN_WORDS=1
 KOKORO_CHUNK_CHARS=80
 KOKORO_MIN_CHUNK_WORDS=2
 KOKORO_INTRA_OP_THREADS=4
@@ -176,3 +224,16 @@ KOKORO_VOICES_PATH=/models/kokoro/voices-v1.0.bin
 Both paths must be configured together and must point to existing files.
 Kokoro uses no API key. Restart the backend after changing any `KOKORO_*`
 model or runtime setting.
+
+## RAG ingestion worker
+
+Uploads and links are stored as durable `queued` database jobs. In local
+development, run the ingestion worker in a second terminal:
+
+```bash
+uv run rag_worker.py
+```
+
+Install its parsing dependencies with `uv sync --extra rag-worker`. Docker
+Compose starts the separate `rag-worker` service automatically; the voice API
+image intentionally excludes Docling and browser-extraction dependencies.

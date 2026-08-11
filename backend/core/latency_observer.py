@@ -7,10 +7,12 @@ import time
 
 from loguru import logger
 from pipecat.frames.frames import (
+    AggregatedTextFrame,
     InputAudioRawFrame,
     LLMFullResponseEndFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
+    TTSTextFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
 
@@ -34,6 +36,8 @@ class PipelineLatencyObserver(BaseObserver):
         TTSAudioRawFrame,
         LLMFullResponseEndFrame,
         TTSStoppedFrame,
+        TTSTextFrame,
+        AggregatedTextFrame,
     )
 
     def __init__(

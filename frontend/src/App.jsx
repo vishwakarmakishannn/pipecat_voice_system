@@ -14,6 +14,7 @@ import { jwtDecode } from 'jwt-decode';
 import { fetchWithAuth, API_BASE } from './utils/api';
 import { buildAudioConstraints, buildIceServers, localSpeechLevelThreshold, webRTCConnectTimeoutMs } from './utils/webrtc';
 import { collectWebRTCAudioStats, createSessionTelemetry, ensureBotAudioPlayback, monitorPeerConnection, publishSessionTelemetry, recordCaptureTrack, recordSelectedCandidatePair, withConnectionDeadline } from './utils/sessionTelemetry';
+import { hasPendingRagFiles } from './utils/ragFiles';
 import './App.css';
 
 const START_ENDPOINT =
@@ -187,7 +188,7 @@ function VoiceApp({ onResetClient }) {
   React.useEffect(() => {
     if (sidebarTab !== 'files') return undefined;
     if (isVoiceBusy) return undefined;
-    if (!ragFiles.some((file) => file.status === 'processing')) return undefined;
+    if (!hasPendingRagFiles(ragFiles)) return undefined;
     const intervalId = window.setInterval(fetchFiles, 2500);
     return () => window.clearInterval(intervalId);
   }, [fetchFiles, isVoiceBusy, ragFiles, sidebarTab]);
@@ -493,6 +494,7 @@ function VoiceApp({ onResetClient }) {
     const webrtcMetrics = await collectWebRTCAudioStats(pcClient?.transport).catch(() => null);
     const completeMetrics = {
       ...(pending.serverPayload || {}),
+      measurement_source: 'client',
       ...clientMetrics,
       ...(webrtcMetrics || {}),
     };

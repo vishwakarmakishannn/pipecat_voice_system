@@ -20,6 +20,7 @@ def _config(tmp_path, **overrides):
         low_latency_enabled=True,
         warmup_enabled=True,
         first_chunk_chars=12,
+        first_chunk_min_words=1,
         chunk_chars=80,
         min_chunk_words=2,
         intra_op_threads=4,

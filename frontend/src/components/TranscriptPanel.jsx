@@ -1,4 +1,5 @@
 import { User, FileText, Wrench, ChevronDown, ChevronRight, Mic } from 'lucide-react';
+import { formatToolCallStatus, hasToolCallResult } from '../utils/toolCalls.js';
 
 export default function TranscriptPanel({
   transcripts,
@@ -34,6 +35,11 @@ export default function TranscriptPanel({
                       <div className="tool-call-header" onClick={() => toggleToolCall(item.id)}>
                         {expandedToolCalls[item.id] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                         <span style={{fontWeight: 500, color: '#475569'}}>{parsed.function_name}</span>
+                        {parsed.status && (
+                          <span className={`tool-call-status tool-call-status-${parsed.status}`}>
+                            {formatToolCallStatus(parsed.status)}
+                          </span>
+                        )}
                       </div>
                       {expandedToolCalls[item.id] && (
                         <div className="tool-call-body">
@@ -41,7 +47,7 @@ export default function TranscriptPanel({
                             <strong style={{fontSize: '0.75rem', color: '#64748b'}}>Arguments</strong>
                             <pre>{JSON.stringify(parsed.arguments, null, 2)}</pre>
                           </div>
-                          {parsed.result && (
+                          {hasToolCallResult(parsed) && (
                             <div className="tool-call-section" style={{marginTop: '8px', borderTop: '1px solid #e2e8f0', paddingTop: '8px'}}>
                               <strong style={{fontSize: '0.75rem', color: '#64748b'}}>Result</strong>
                               <pre style={{maxHeight: '200px', overflowY: 'auto'}}>{JSON.stringify(parsed.result, null, 2)}</pre>

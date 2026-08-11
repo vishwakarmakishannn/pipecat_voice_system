@@ -1,7 +1,14 @@
 from types import SimpleNamespace
 
 import pytest
-from pipecat.frames.frames import InputAudioRawFrame, LLMFullResponseEndFrame, TTSAudioRawFrame, TTSStoppedFrame
+from pipecat.frames.frames import (
+    AggregatedTextFrame,
+    InputAudioRawFrame,
+    LLMFullResponseEndFrame,
+    TTSAudioRawFrame,
+    TTSStoppedFrame,
+    TTSTextFrame,
+)
 
 from core.latency_observer import EventLoopLagMonitor, PipelineLatencyObserver
 
@@ -40,6 +47,8 @@ async def test_event_loop_lag_monitor_starts_once_and_stops():
         TTSAudioRawFrame(b"\x00\x00", 24000, 1),
         LLMFullResponseEndFrame(),
         TTSStoppedFrame(),
+        TTSTextFrame("streamed tts text", "sentence"),
+        AggregatedTextFrame("normal aggregation", "sentence"),
     ],
 )
 async def test_pipeline_latency_observer_ignores_high_volume_and_drain_frames(

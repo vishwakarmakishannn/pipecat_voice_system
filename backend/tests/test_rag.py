@@ -43,6 +43,7 @@ from services.rag import (
     clear_rag_result_cache,
 )
 import services.rag as rag_service
+from core.context_summary import ContextMutationEpoch, QUERY_SCOPED_CONTEXT_MARKER
 
 
 def test_voice_years_are_canonicalized_without_source_phrase_rules():
@@ -194,12 +195,11 @@ async def test_ready_corpus_gate_bypasses_rag_before_embedding(monkeypatch):
 def test_retrieval_deadline_is_derived_from_concurrent_route_branches(monkeypatch):
     monkeypatch.setattr("core.processors.RAG_VOICE_MEMORY_TIMEOUT_SECONDS", 0.4)
     monkeypatch.setattr("core.processors.RAG_VOICE_RAG_TIMEOUT_SECONDS", 1.2)
-    monkeypatch.setattr("core.processors.RAG_VOICE_WEB_TIMEOUT_SECONDS", 2.0)
     monkeypatch.setattr("core.processors.RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS", 2.5)
 
-    assert ContextRetrievalProcessor._route_deadline(True, False, False) == pytest.approx(0.5)
-    assert ContextRetrievalProcessor._route_deadline(False, True, False) == pytest.approx(1.3)
-    assert ContextRetrievalProcessor._route_deadline(True, True, True) == pytest.approx(2.1)
+    assert ContextRetrievalProcessor._route_deadline(True, False) == pytest.approx(0.5)
+    assert ContextRetrievalProcessor._route_deadline(False, True) == pytest.approx(1.3)
+    assert ContextRetrievalProcessor._route_deadline(True, True) == pytest.approx(1.3)
 
 
 def test_interrupted_response_does_not_remove_fresh_rag_context():
@@ -225,6 +225,22 @@ def test_authoritative_user_turn_start_clears_dynamic_context():
     processor.start_user_turn()
 
     assert message not in context.messages
+
+
+def test_dynamic_context_removal_increments_mutation_epoch_only_when_removed():
+    epoch = ContextMutationEpoch()
+    context = LLMContext(messages=[])
+    processor = ContextRetrievalProcessor(
+        1, 1, context, mutation_epoch=epoch
+    )
+    message = {"role": "developer", "content": "old turn context"}
+    context.add_message(message)
+    processor._dynamic_messages.append(message)
+
+    processor.clear_dynamic_context()
+    processor.clear_dynamic_context()
+
+    assert epoch.value == 1
 
 
 @pytest.mark.anyio
@@ -290,7 +306,7 @@ async def test_slow_optional_rag_branch_fails_open_at_its_own_deadline(monkeypat
     await asyncio.wait_for(
         processor._retrieve_and_push(
             frame, "my document", FrameDirection.DOWNSTREAM,
-            False, True, False, 1,
+            False, True, 1,
         ),
         timeout=0.1,
     )
@@ -326,12 +342,13 @@ async def test_failed_retrieval_branch_preserves_successful_branch(monkeypatch):
         FrameDirection.DOWNSTREAM,
         True,
         True,
-        False,
         1,
     )
 
     assert delivered == [frame]
-    assert context.messages[-1]["content"] == "Relevant memory that must survive."
+    assert context.messages[-1]["content"] == (
+        f"{QUERY_SCOPED_CONTEXT_MARKER}\nRelevant memory that must survive."
+    )
 
 
 @pytest.mark.anyio
@@ -370,12 +387,13 @@ async def test_memory_timeout_does_not_cancel_shared_embedding_for_rag(monkeypat
         FrameDirection.DOWNSTREAM,
         True,
         True,
-        False,
         1,
     )
 
     assert delivered == [frame]
-    assert context.messages[-1]["content"] == "RAG context survived."
+    assert context.messages[-1]["content"] == (
+        f"{QUERY_SCOPED_CONTEXT_MARKER}\nRAG context survived."
+    )
 
 
 def test_smart_router_injects_without_document_words_when_vector_match_is_strong():
@@ -837,7 +855,37 @@ async def test_answer_audio_uses_turn_release_not_final_stt_as_origin(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_llm_completion_keeps_realtime_gate_until_first_audio(monkeypatch):
+async def test_first_audio_persists_server_latency_without_browser_callback(monkeypatch):
+    queued = []
+    state = TurnLatencyState(session_id="server-session", user_id=9)
+    state.start_turn()
+    state.first_llm_seen = True
+    boundary = LatencyBoundaryProcessor(state, "tts")
+
+    async def discard(_frame, _direction):
+        return None
+
+    monkeypatch.setattr(boundary, "push_frame", discard)
+    monkeypatch.setattr(
+        "core.processors.task_queue.enqueue",
+        lambda *args, **kwargs: queued.append((args, kwargs)) or True,
+    )
+
+    await boundary.process_frame(
+        TTSAudioRawFrame(b"\x01\x00", 24000, 1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert len(queued) == 1
+    args, kwargs = queued[0]
+    assert args[1] == 9
+    assert args[2]["measurement_source"] == "server"
+    assert args[2]["latency_complete"] is True
+    assert kwargs["key"] == "voice-latency-9"
+
+
+@pytest.mark.anyio
+async def test_llm_completion_keeps_realtime_gate_until_tts_stops(monkeypatch):
     from core.realtime_gate import realtime_turn_gate
 
     baseline = realtime_turn_gate.active
@@ -861,6 +909,9 @@ async def test_llm_completion_keeps_realtime_gate_until_first_audio(monkeypatch)
         TTSAudioRawFrame(b"\x01\x00", 24000, 1),
         FrameDirection.DOWNSTREAM,
     )
+    assert realtime_turn_gate.active == baseline + 1
+
+    await tts_boundary.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
     assert realtime_turn_gate.active == baseline
 
 
@@ -1005,7 +1056,6 @@ async def test_combined_memory_and_rag_share_one_embedding(monkeypatch):
         FrameDirection.DOWNSTREAM,
         True,
         True,
-        False,
         1,
     )
 
@@ -1044,7 +1094,6 @@ async def test_rag_only_route_does_not_disable_query_embedding(monkeypatch):
         FrameDirection.DOWNSTREAM,
         False,
         True,
-        False,
         1,
     )
 
@@ -1052,206 +1101,28 @@ async def test_rag_only_route_does_not_disable_query_embedding(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_deterministic_web_search_runs_before_llm_and_suppresses_tool_pass(monkeypatch):
-    context = LLMContext(messages=[])
-    state = TurnLatencyState(session_id="test")
-    state.start_turn()
+async def test_context_retrieval_leaves_web_query_planning_to_llm_router(monkeypatch):
+    messages = [
+        {"role": "user", "content": "I was thinking to buy galaxy a30s"},
+        {"role": "assistant", "content": "It has a 48MP main camera."},
+        {"role": "user", "content": "You are wrong with the camera specs"},
+    ]
+    context = LLMContext(messages=list(messages))
     delivered = []
-
-    async def fake_web_search(query):
-        await asyncio.sleep(0)
-        return {"query": query, "answer": "It is sunny."}
 
     async def capture(frame, _direction):
         delivered.append(frame)
 
-    processor = ContextRetrievalProcessor(
-        1,
-        1,
-        context,
-        state,
-        web_search=fake_web_search,
-    )
+    processor = ContextRetrievalProcessor(1, 1, context)
     monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: False)
     monkeypatch.setattr(processor, "push_frame", capture)
-    context.add_message({"role": "user", "content": "look up the latest weather"})
     frame = LLMContextFrame(context)
 
     await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
-    task = processor._active_task
-    assert task is not None
-    await asyncio.wait_for(task, timeout=0.2)
 
-    tool_messages = [
-        item.message["data"]
-        for item in delivered
-        if isinstance(item, OutputTransportMessageFrame)
-        and item.message["data"]["type"] == "tool_call"
-    ]
-    assert [message["payload"]["status"] for message in tool_messages] == [
-        "in_progress",
-        "completed",
-    ]
-    assert tool_messages[-1]["payload"]["result"]["answer"] == "It is sunny."
-    assert isinstance(delivered[0], OutputTransportMessageFrame)
-    assert delivered[0].message["data"]["type"] == "tool_call"
-    assert not any(isinstance(item, TTSSpeakFrame) for item in delivered)
-    assert delivered[-1] is frame
-    assert processor.web_search_resolved is True
-    assert processor.tool_filler_emitted is False
-    assert state.tool_used is True
-    assert any("It is sunny" in message.get("content", "") for message in context.messages)
-
-    router = ToolRoutingProcessor(
-        context,
-        search_tool=lambda: None,
-        issue_tool=lambda: None,
-        retrieval=processor,
-    )
-    assert router.route() == []
-
-
-@pytest.mark.anyio
-async def test_slow_deterministic_web_search_emits_filler_audio_and_transcript(monkeypatch):
-    context = LLMContext(messages=[
-        {"role": "user", "content": "look up today's weather"}
-    ])
-    release_search = asyncio.Event()
-    delivered = []
-    state = TurnLatencyState(session_id="test")
-    state.start_turn()
-
-    async def slow_web_search(_query):
-        await release_search.wait()
-        return {"answer": "Sunny"}
-
-    async def capture(frame, _direction):
-        delivered.append(frame)
-
-    processor = ContextRetrievalProcessor(
-        1,
-        1,
-        context,
-        state,
-        web_search=slow_web_search,
-        filler_delay_seconds=0.01,
-        filler_enabled=True,
-    )
-    monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: False)
-    monkeypatch.setattr(processor, "push_frame", capture)
-
-    await processor.process_frame(LLMContextFrame(context), FrameDirection.DOWNSTREAM)
-    await asyncio.sleep(0.02)
-
-    assert any(isinstance(frame, TTSSpeakFrame) for frame in delivered)
-    assert any(
-        isinstance(frame, OutputTransportMessageFrame)
-        and frame.message["data"]["type"] == "assistant_transcript"
-        for frame in delivered
-    )
-    assert processor.tool_filler_emitted is True
-    assert state.tool_filler_spoken is True
-
-    release_search.set()
-    await asyncio.wait_for(processor._active_task, timeout=0.2)
-
-
-@pytest.mark.anyio
-async def test_timed_out_deterministic_search_is_not_exposed_to_llm_again(monkeypatch):
-    context = LLMContext(messages=[
-        {"role": "user", "content": "Who is the current president of India?"}
-    ])
-    delivered = []
-
-    async def stalled_web_search(_query):
-        await asyncio.Event().wait()
-
-    async def capture(frame, _direction):
-        delivered.append(frame)
-
-    processor = ContextRetrievalProcessor(
-        1,
-        1,
-        context,
-        web_search=stalled_web_search,
-        filler_enabled=False,
-    )
-    monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: False)
-    monkeypatch.setattr("core.processors.RAG_VOICE_WEB_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(processor, "push_frame", capture)
-
-    await processor.process_frame(LLMContextFrame(context), FrameDirection.DOWNSTREAM)
-    await asyncio.wait_for(processor._active_task, timeout=0.2)
-
-    assert processor.web_search_attempted is True
-    assert processor.web_search_resolved is True
-    assert any(
-        message.get("role") == "developer" and "timed out" in message.get("content", "")
-        for message in context.messages
-    )
-    router = ToolRoutingProcessor(
-        context,
-        search_tool=lambda: None,
-        issue_tool=lambda: None,
-        retrieval=processor,
-    )
-    assert router.route() == []
-
-    tool_events = [
-        frame.message["data"]["payload"]
-        for frame in delivered
-        if isinstance(frame, OutputTransportMessageFrame)
-        and frame.message["data"]["type"] == "tool_call"
-    ]
-    assert [event["status"] for event in tool_events] == ["in_progress", "completed"]
-    assert tool_events[-1]["result"]["status"] == "timeout"
-
-
-@pytest.mark.anyio
-async def test_deterministic_web_search_waits_for_tool_result_after_filler_window(monkeypatch):
-    context = LLMContext(messages=[
-        {"role": "user", "content": "Who is the current prime minister of India?"}
-    ])
-    delivered = []
-
-    async def slower_web_search(_query):
-        await asyncio.sleep(0.05)
-        return {"answer": "Narendra Modi is the current Prime Minister of India."}
-
-    async def capture(frame, _direction):
-        delivered.append(frame)
-
-    processor = ContextRetrievalProcessor(
-        1,
-        1,
-        context,
-        web_search=slower_web_search,
-        filler_delay_seconds=0.01,
-        filler_enabled=True,
-    )
-    monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: False)
-    monkeypatch.setattr("core.processors.RAG_VOICE_WEB_TIMEOUT_SECONDS", 0.1)
-    monkeypatch.setattr("core.processors.RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr(processor, "push_frame", capture)
-
-    await processor.process_frame(LLMContextFrame(context), FrameDirection.DOWNSTREAM)
-    await asyncio.wait_for(processor._active_task, timeout=0.2)
-
-    assert any(isinstance(frame, TTSSpeakFrame) for frame in delivered)
-    assert any(
-        "Narendra Modi is the current Prime Minister of India"
-        in message.get("content", "")
-        for message in context.messages
-    )
-    tool_events = [
-        frame.message["data"]["payload"]
-        for frame in delivered
-        if isinstance(frame, OutputTransportMessageFrame)
-        and frame.message["data"]["type"] == "tool_call"
-    ]
-    assert tool_events[-1]["result"]["answer"] == (
-        "Narendra Modi is the current Prime Minister of India."
-    )
+    assert processor._active_task is None
+    assert delivered == [frame]
+    assert context.messages == messages
 
 
 @pytest.mark.anyio
@@ -1317,7 +1188,6 @@ async def test_rag_call_transcript_is_delivered_before_llm_context(monkeypatch):
         FrameDirection.DOWNSTREAM,
         False,
         True,
-        False,
         1,
     )
 
@@ -1380,28 +1250,22 @@ async def test_rag_filler_precedes_rag_call_transcript(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_generic_current_language_does_not_launch_pre_llm_web_search(monkeypatch):
+async def test_generic_current_language_bypasses_context_retrieval(monkeypatch):
     context = LLMContext(messages=[
         {"role": "user", "content": "I am currently fixing the searchlight"}
     ])
-    searches = []
     delivered = []
-
-    async def web_search(query):
-        searches.append(query)
-        return {"answer": "unexpected"}
 
     async def capture(frame, _direction):
         delivered.append(frame)
 
-    processor = ContextRetrievalProcessor(1, 1, context, web_search=web_search)
+    processor = ContextRetrievalProcessor(1, 1, context)
     monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: False)
     monkeypatch.setattr(processor, "push_frame", capture)
     frame = LLMContextFrame(context)
 
     await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-    assert searches == []
     assert processor._active_task is None
     assert delivered == [frame]
 
@@ -1432,6 +1296,71 @@ async def test_validate_public_http_url_rejects_private_addresses(monkeypatch):
 
     with pytest.raises(ValueError):
         await validate_public_http_url("https://example.com")
+
+
+def test_safe_fetch_rejects_redirect_to_private_target(monkeypatch):
+    class Headers(dict):
+        def get_content_charset(self):
+            return None
+
+    monkeypatch.setattr(
+        rag_service,
+        "_request_pinned",
+        lambda *_args: (302, Headers(location="http://127.0.0.1/admin"), b""),
+    )
+
+    with pytest.raises(ValueError, match="private or local"):
+        rag_service._fetch_bytes(
+            "https://example.com/article",
+            max_bytes=1024,
+            accepted_content_types=("text/html",),
+        )
+
+
+@pytest.mark.anyio
+async def test_robots_rules_are_enforced_without_network_robotparser(monkeypatch):
+    monkeypatch.setattr(rag_service, "RAG_LINK_RESPECT_ROBOTS", True)
+    monkeypatch.setattr(
+        rag_service,
+        "_fetch_bytes",
+        lambda *_args, **_kwargs: (
+            b"User-agent: *\nDisallow: /private\n",
+            "https://example.com/robots.txt",
+            "utf-8",
+        ),
+    )
+
+    assert await rag_service._robots_allowed("https://example.com/public") is True
+    assert await rag_service._robots_allowed("https://example.com/private/report") is False
+
+
+@pytest.mark.anyio
+async def test_extract_link_stops_when_robots_disallow(monkeypatch):
+    monkeypatch.setattr(
+        rag_service, "validate_public_http_url", lambda url: asyncio.sleep(0, result=url)
+    )
+    monkeypatch.setattr(
+        rag_service, "_robots_allowed", lambda _url: asyncio.sleep(0, result=False)
+    )
+    called = False
+
+    async def extractor(_url):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(rag_service, "_extract_link_with_trafilatura", extractor)
+
+    with pytest.raises(ValueError, match="robots.txt"):
+        await rag_service.extract_link("https://example.com/private")
+
+    assert called is False
+
+
+def test_untrusted_link_extraction_defaults_to_non_browser_path():
+    from core.rag_config import RAG_ALLOW_BROWSER_EXTRACTOR, RAG_LINK_EXTRACTOR
+
+    assert RAG_LINK_EXTRACTOR == "trafilatura"
+    assert RAG_ALLOW_BROWSER_EXTRACTOR is False
 
 
 def test_chunk_link_markdown_preserves_heading_context():

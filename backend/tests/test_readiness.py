@@ -76,6 +76,18 @@ def test_voice_provider_configuration_rejects_unsupported_provider(monkeypatch):
         validate_voice_provider_configuration()
 
 
+def test_voice_provider_configuration_rejects_invalid_timezone(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "secret")
+    monkeypatch.setenv("STT_PROVIDER", "deepgram")
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "secret")
+    monkeypatch.setenv("TTS_PROVIDER", "piper")
+    monkeypatch.setenv("VOICE_TIMEZONE", "Not/A_Zone")
+
+    with pytest.raises(ValueError, match="VOICE_TIMEZONE"):
+        validate_voice_provider_configuration()
+
+
 def test_whisper_readiness_requires_no_stt_credential(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "groq")
     monkeypatch.setenv("GROQ_API_KEY", "secret")
@@ -174,6 +186,7 @@ def test_local_llm_readiness_requires_no_cloud_credential(monkeypatch):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("VOICE_CONTEXT_SUMMARIZATION_ENABLED", "false")
     monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080/v1")
     monkeypatch.setenv("LOCAL_LLM_MODEL", "qwen3-4b-local")
     monkeypatch.setenv("VOICE_MAX_CONCURRENT_SESSIONS", "2")
@@ -186,6 +199,20 @@ def test_local_llm_readiness_requires_no_cloud_credential(monkeypatch):
         "stt": "whisper",
         "tts": "piper",
     }
+
+
+def test_enabled_context_summarization_requires_groq(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080/v1")
+    monkeypatch.setenv("VOICE_MAX_CONCURRENT_SESSIONS", "2")
+    monkeypatch.setenv("STT_PROVIDER", "whisper")
+    monkeypatch.setenv("AUDIO_INPUT_SAMPLE_RATE", "16000")
+    monkeypatch.setenv("TTS_PROVIDER", "piper")
+    monkeypatch.setenv("VOICE_CONTEXT_SUMMARIZATION_ENABLED", "true")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="live context summarization"):
+        validate_voice_provider_configuration()
 
 
 def test_local_llm_readiness_rejects_more_than_two_sessions(monkeypatch):

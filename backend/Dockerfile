@@ -25,7 +25,13 @@ COPY . .
 # Install the actual project using uv
 RUN uv sync --frozen --no-dev
 
-FROM python:3.14-slim AS runtime
+FROM builder AS rag-builder
+
+# Document parsing/browser packages (and their OpenCV/FFmpeg bindings) exist
+# only in the ingestion image, never in the latency-sensitive voice image.
+RUN uv sync --frozen --no-dev --extra rag-worker
+
+FROM python:3.14-slim AS runtime-base
 
 WORKDIR /app
 
@@ -39,11 +45,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app /app
-
 # Schema migration is an explicit deployment job (the Compose `migrate`
 # service), so application replicas can start concurrently without contending
 # on Alembic locks.
+FROM runtime-base AS rag-runtime
+
+COPY --from=rag-builder /app /app
+
+CMD ["python", "rag_worker.py"]
+
+FROM runtime-base AS runtime
+
+COPY --from=builder /app /app
+
 # Containers must listen on every interface so sibling services (the frontend
 # reverse proxy) can reach the API over the Compose network.
 CMD ["python", "main.py", "--host", "0.0.0.0"]

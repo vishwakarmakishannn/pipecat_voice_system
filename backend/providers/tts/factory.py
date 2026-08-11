@@ -29,8 +29,12 @@ def get_tts():
 async def warm_tts_provider() -> None:
     """Warm only the selected provider's process-wide runtime."""
     if _selected_provider() == "kokoro":
+        from .kokoro_tts import warm_kokoro_adapter
         from .kokoro_runtime import warm_kokoro_runtime
 
+        # Session construction creates an independent resampler. Prime its
+        # import/native setup before accepting any voice traffic.
+        await __import__("asyncio").to_thread(warm_kokoro_adapter)
         await warm_kokoro_runtime()
 
 

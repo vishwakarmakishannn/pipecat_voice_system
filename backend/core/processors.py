@@ -43,15 +43,20 @@ from core.rag_config import (
     RAG_VOICE_MEMORY_TIMEOUT_SECONDS,
     RAG_VOICE_RAG_TIMEOUT_SECONDS,
     RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS,
-    RAG_VOICE_WEB_TIMEOUT_SECONDS,
 )
-from core.tool_config import tool_filler_delay_seconds, tool_filler_enabled
+from core.tool_config import (
+    tool_filler_delay_seconds,
+    tool_filler_enabled,
+)
+from core.context_summary import QUERY_SCOPED_CONTEXT_MARKER
 from core.audio_config import (
     trim_tts_leading_silence,
     tts_silence_preroll_ms,
     tts_silence_threshold,
 )
 from core.realtime_gate import realtime_turn_gate
+from core.task_queue import task_queue
+from services.latency_telemetry import persist_voice_latency
 
 
 def transport_server_message(
@@ -80,6 +85,7 @@ class TurnLatencyState:
         default=None, repr=False
     )
     session_id: str | None = None
+    user_id: int | None = None
     stt_provider: str | None = None
     stt_model: str | None = None
     llm_provider: str | None = None
@@ -240,13 +246,17 @@ class TurnLatencyState:
         self.emit("final_stt_fragment")
 
     def finish_response(self):
-        """Close LLM processing without releasing work ahead of first audio."""
+        """Close LLM processing while TTS still owns the realtime gate."""
         self.response_finished = True
         self.active = False
         self.speech_turn_open = False
-        if self.first_audio_seen:
-            realtime_turn_gate.end(self.priority_key)
-            self.turn_identity_open = False
+
+    def finish_tts(self):
+        """Release deferred work only after response audio generation ends."""
+        realtime_turn_gate.end(self.priority_key)
+        self.active = False
+        self.speech_turn_open = False
+        self.turn_identity_open = False
 
     def finish_turn(self):
         """Force-close a cancelled/no-audio turn and release its gate."""
@@ -441,7 +451,6 @@ class LatencyBoundaryProcessor(FrameProcessor):
             ):
                 self._state.first_audio_seen = True
                 self._state.claim_latency_stage("tts")
-                realtime_turn_gate.end(self._state.priority_key)
                 audio_at = time.monotonic()
                 self._state.mark_stage("first_tts_audio", audio_at)
                 self._state.emit("first_tts_audio")
@@ -450,17 +459,26 @@ class LatencyBoundaryProcessor(FrameProcessor):
                     self._state.latency_stats_payload("tts"),
                     urgent=True,
                 )
-                if self._state.response_finished:
-                    self._state.turn_identity_open = False
+                if self._state.user_id is not None:
+                    server_payload = {
+                        **self._state.latency_stats_payload("tts"),
+                        "measurement_source": "server",
+                        "playback_signal": "first_generated_tts_audio",
+                    }
+                    task_queue.enqueue(
+                        persist_voice_latency,
+                        self._state.user_id,
+                        server_payload,
+                        key=f"voice-latency-{self._state.user_id}",
+                    )
             elif (
                 self._boundary == "tts"
                 and isinstance(frame, TTSStoppedFrame)
                 and self._state.first_llm_seen
-                and not self._state.first_audio_seen
             ):
-                # Empty, cancelled, or provider-failed responses must never
-                # leave background enrichment gated forever.
-                self._state.finish_turn()
+                # Normal and empty/provider-failed responses release deferred
+                # enrichment only after the TTS service is fully finished.
+                self._state.finish_tts()
         # Urgent telemetry must lead the corresponding work/media frame. This
         # both bypasses TTS media serialization and lets the browser associate
         # its first decoded audio sample with the correct turn.
@@ -550,6 +568,16 @@ class LeadingSilenceTrimmerProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+def immutable_context_messages(messages: list[dict]) -> list[dict]:
+    """Return only instruction/memory-prefix messages that must never trim."""
+    return [
+        message
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") in {"system", "developer"}
+    ]
+
+
 class BoundedContextProcessor(FrameProcessor):
     def __init__(
         self,
@@ -557,6 +585,8 @@ class BoundedContextProcessor(FrameProcessor):
         protected_messages: list[dict] | None = None,
         max_messages: int = 24,
         max_chars: int = 18000,
+        mutation_epoch=None,
+        trim_status: str = "trimmed",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -564,6 +594,8 @@ class BoundedContextProcessor(FrameProcessor):
         self._protected_ids = {id(message) for message in (protected_messages or [])}
         self._max_messages = max(2, max_messages)
         self._max_chars = max(1000, max_chars)
+        self._mutation_epoch = mutation_epoch
+        self._trim_status = trim_status
 
     def protect_messages(self, messages: list[dict]) -> None:
         self._protected_ids.update(id(message) for message in messages)
@@ -617,8 +649,11 @@ class BoundedContextProcessor(FrameProcessor):
         removed = len(messages) - len(selected)
         if removed:
             messages[:] = selected
+            if self._mutation_epoch:
+                self._mutation_epoch.bump(self._trim_status)
             logger.info(
-                "voice_context status=trimmed removed={} retained={} chars={}",
+                "voice_context status={} removed={} retained={} chars={}",
+                self._trim_status,
                 removed,
                 len(selected),
                 selected_chars,
@@ -633,12 +668,6 @@ class BoundedContextProcessor(FrameProcessor):
 
 
 class ToolRoutingProcessor(FrameProcessor):
-    SEARCH_PATTERNS = (
-        re.compile(r"\b(?:search|browse)(?:\s+(?:the\s+)?(?:web|internet|online))?\b"),
-        re.compile(r"\blook\s+up\b"),
-        re.compile(r"\b(?:latest|today(?:'s)?|news|weather|stock\s+price)\b"),
-        re.compile(r"\bcurrent\s+(?:price|weather|president|prime\s+minister|events?|news)\b"),
-    )
     ISSUE_PATTERNS = (
         re.compile(r"\b(?:raise|create|open|file)\s+(?:an?\s+)?(?:issue|ticket|complaint)\b"),
         re.compile(r"\breport\s+(?:a\s+)?problem\b"),
@@ -667,12 +696,6 @@ class ToolRoutingProcessor(FrameProcessor):
         re.compile(r"\b\d{6,}\b"),
         re.compile(r"\b[a-z]{1,8}\d{4,}\b"),
     )
-
-    @classmethod
-    def needs_web_search(cls, text: str) -> bool:
-        normalized = " ".join((text or "").lower().split())
-        return any(pattern.search(normalized) for pattern in cls.SEARCH_PATTERNS)
-
     @classmethod
     def needs_issue_tool(cls, text: str) -> bool:
         normalized = " ".join((text or "").lower().split())
@@ -683,7 +706,7 @@ class ToolRoutingProcessor(FrameProcessor):
         context: LLMContext,
         search_tool,
         issue_tool,
-        retrieval=None,
+        datetime_tool,
         latency_state: TurnLatencyState | None = None,
         **kwargs,
     ):
@@ -691,7 +714,7 @@ class ToolRoutingProcessor(FrameProcessor):
         self._context = context
         self._search_tool = search_tool
         self._issue_tool = issue_tool
-        self._retrieval = retrieval
+        self._datetime_tool = datetime_tool
         self._latency_state = latency_state
         self._issue_workflow_active = False
 
@@ -751,18 +774,17 @@ class ToolRoutingProcessor(FrameProcessor):
 
     def route(self) -> list:
         text = self._latest_user_text(self._context).lower()
-        tools = []
-        web_search_already_attempted = bool(
-            self._retrieval and self._retrieval.web_search_attempted
-        )
-        if self.needs_web_search(text) and not web_search_already_attempted:
-            tools.append(self._search_tool)
+        # Read-only tools remain universally available. Semantic selection
+        # belongs to the LLM, which has the full conversation and the stable
+        # session date in its system instruction.
+        tools = [self._datetime_tool, self._search_tool]
         issue_workflow_active = self._issue_workflow_is_active(text)
         if issue_workflow_active:
             tools.append(self._issue_tool)
         self._context.set_tools(tools)
+        self._context.set_tool_choice("auto")
         logger.info(
-            "voice_tools exposed={} issue_workflow_active={} query={!r}",
+            "voice_tools exposed={} tool_choice=auto issue_workflow_active={} query={!r}",
             [getattr(tool, "__name__", str(tool)) for tool in tools],
             issue_workflow_active,
             text[:120],
@@ -775,9 +797,9 @@ class ToolRoutingProcessor(FrameProcessor):
             tools = self.route()
             if tools:
                 if self._latency_state:
-                    self._latency_state.tool_used = True
                     self._latency_state.mark_stage("tool_routed")
         await self.push_frame(frame, direction)
+
 
 class ConversationMemoryProcessor(FrameProcessor):
     def __init__(self, conversation_id: int | None, capture: str, **kwargs):
@@ -956,10 +978,10 @@ class ContextRetrievalProcessor(FrameProcessor):
         conversation_id: int | None,
         context: LLMContext,
         latency_state: TurnLatencyState | None = None,
-        web_search=None,
         ready_corpus_check=None,
         filler_delay_seconds: float | None = None,
         filler_enabled: bool | None = None,
+        mutation_epoch=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -967,29 +989,17 @@ class ContextRetrievalProcessor(FrameProcessor):
         self._conversation_id = conversation_id
         self._context = context
         self._latency_state = latency_state
-        self._web_search = web_search
         self._ready_corpus_check = ready_corpus_check
         self._active_task: asyncio.Task | None = None
         self._retrieval_generation = 0
         self._dynamic_messages: list[dict] = []
-        self._web_search_resolved = False
-        self._web_search_attempted = False
         self._tool_filler_emitted = False
         self._filler_delay_seconds = (
             tool_filler_delay_seconds() if filler_delay_seconds is None else filler_delay_seconds
         )
         self._filler_enabled = tool_filler_enabled() if filler_enabled is None else filler_enabled
-        self._proactive_filler_task: asyncio.Task | None = None
         self._rag_filler_task: asyncio.Task | None = None
-        self._active_web_call_id: str | None = None
-
-    @property
-    def web_search_resolved(self) -> bool:
-        return self._web_search_resolved
-
-    @property
-    def web_search_attempted(self) -> bool:
-        return self._web_search_attempted
+        self._mutation_epoch = mutation_epoch
 
     @property
     def tool_filler_emitted(self) -> bool:
@@ -1000,13 +1010,10 @@ class ContextRetrievalProcessor(FrameProcessor):
         if self._active_task and not self._active_task.done():
             self._active_task.cancel()
         self._active_task = None
-        self._cancel_proactive_filler()
+        self._cancel_rag_filler()
         return self._retrieval_generation
 
-    def _cancel_proactive_filler(self) -> None:
-        if self._proactive_filler_task and not self._proactive_filler_task.done():
-            self._proactive_filler_task.cancel()
-        self._proactive_filler_task = None
+    def _cancel_rag_filler(self) -> None:
         if self._rag_filler_task and not self._rag_filler_task.done():
             self._rag_filler_task.cancel()
         self._rag_filler_task = None
@@ -1038,25 +1045,6 @@ class ContextRetrievalProcessor(FrameProcessor):
             direction,
         )
 
-    async def _delayed_proactive_filler(
-        self,
-        tool_call_id: str,
-        generation: int,
-        direction: FrameDirection,
-    ) -> None:
-        try:
-            await asyncio.sleep(self._filler_delay_seconds)
-            if (
-                self._is_current_generation(generation)
-                and self._active_web_call_id == tool_call_id
-            ):
-                # Once emission starts, result handling must not cancel between
-                # the transcript event and its matching TTS frame.
-                self._proactive_filler_task = None
-                await self._emit_proactive_filler(tool_call_id, direction)
-        except asyncio.CancelledError:
-            return
-
     async def _delayed_rag_filler(
         self,
         filler_id: str,
@@ -1071,74 +1059,16 @@ class ContextRetrievalProcessor(FrameProcessor):
         except asyncio.CancelledError:
             return
 
-    async def _start_web_tool(
-        self,
-        query: str,
-        generation: int,
-        direction: FrameDirection,
-    ) -> str:
-        turn_id = self._latency_state.turn_id if self._latency_state else generation
-        tool_call_id = f"web-search-{turn_id}-{generation}"
-        self._active_web_call_id = tool_call_id
-        # This deterministic search owns web lookup for the turn even if the
-        # provider times out. The LLM must consume its fallback, not call the
-        # same tool a second time.
-        self._web_search_attempted = True
-        if self._filler_enabled and self._filler_delay_seconds == 0:
-            await self._emit_proactive_filler(tool_call_id, direction)
-        await self.push_frame(
-            transport_server_message(
-                "tool_call",
-                {
-                    "tool_call_id": tool_call_id,
-                    "function_name": "tavily_search",
-                    "arguments": {"query": query},
-                    "status": "in_progress",
-                },
-            ),
-            direction,
-        )
-        if self._filler_enabled and self._filler_delay_seconds > 0:
-            self._proactive_filler_task = asyncio.create_task(
-                self._delayed_proactive_filler(tool_call_id, generation, direction)
-            )
-        return tool_call_id
-
-    async def _finish_web_tool(
-        self,
-        tool_call_id: str | None,
-        result,
-        status: str,
-        direction: FrameDirection,
-    ) -> None:
-        if not tool_call_id or self._active_web_call_id != tool_call_id:
-            return
-        self._cancel_proactive_filler()
-        self._active_web_call_id = None
-        await self.push_frame(
-            transport_server_message(
-                "tool_call",
-                {
-                    "tool_call_id": tool_call_id,
-                    "function_name": "tavily_search",
-                    "result": ToolFillerProcessor._json_safe(result),
-                    "status": status,
-                },
-            ),
-            direction,
-        )
-
     def _is_current_generation(self, generation: int) -> bool:
         return generation == self._retrieval_generation
 
     @staticmethod
-    def _route_deadline(needs_memory: bool, needs_rag: bool, needs_web: bool) -> float:
+    def _route_deadline(needs_memory: bool, needs_rag: bool) -> float:
         branch_deadlines = [
             timeout
             for enabled, timeout in (
                 (needs_memory, RAG_VOICE_MEMORY_TIMEOUT_SECONDS),
                 (needs_rag, RAG_VOICE_RAG_TIMEOUT_SECONDS),
-                (needs_web, RAG_VOICE_WEB_TIMEOUT_SECONDS),
             )
             if enabled
         ]
@@ -1193,27 +1123,13 @@ class ContextRetrievalProcessor(FrameProcessor):
                         "voice_route route=direct reason=no_ready_corpus query={!r}",
                         combined_query[:120],
                     )
-            needs_web = bool(
-                self._web_search
-                and ToolRoutingProcessor.needs_web_search(combined_query)
-            )
-            if not needs_memory and not needs_rag and not needs_web:
+            if not needs_memory and not needs_rag:
                 self._supersede_active_retrieval()
                 logger.info("voice_route route=direct query={!r}", combined_query[:120])
                 await self.push_frame(frame, direction)
                 return
 
-            if needs_web:
-                if self._latency_state:
-                    self._latency_state.tool_used = True
-                    self._latency_state.mark_stage("tool_started")
-
             generation = self._supersede_active_retrieval()
-            tool_call_id = None
-            if needs_web:
-                tool_call_id = await self._start_web_tool(
-                    combined_query, generation, direction
-                )
             if needs_rag and self._filler_enabled:
                 turn_id = self._latency_state.turn_id if self._latency_state else generation
                 rag_filler_id = f"rag-{turn_id}-{generation}"
@@ -1230,9 +1146,7 @@ class ContextRetrievalProcessor(FrameProcessor):
                     direction,
                     needs_memory,
                     needs_rag,
-                    needs_web,
                     generation,
-                    tool_call_id,
                 )
             )
             if self._latency_state:
@@ -1253,9 +1167,7 @@ class ContextRetrievalProcessor(FrameProcessor):
         direction,
         needs_memory,
         needs_rag,
-        needs_web,
         generation,
-        tool_call_id=None,
     ):
         started = time.monotonic()
         delivered = False
@@ -1317,23 +1229,9 @@ class ContextRetrievalProcessor(FrameProcessor):
                         )
                     else:
                         rag_task = asyncio.sleep(0, result=(None, None))
-                    web_task = self._web_search(combined_query) if needs_web else asyncio.sleep(0, result=None)
-                    web_fallback = {
-                        "status": "timeout",
-                        "message": (
-                            "Web search timed out. Answer briefly from available knowledge "
-                            "and disclose that live verification was unavailable."
-                        ),
-                    }
-                    memory_context, (rag_context, rag_payload), web_payload = await asyncio.gather(
+                    memory_context, (rag_context, rag_payload) = await asyncio.gather(
                         bounded_branch(memory_task, RAG_VOICE_MEMORY_TIMEOUT_SECONDS, None, "memory"),
                         bounded_branch(rag_task, RAG_VOICE_RAG_TIMEOUT_SECONDS, (None, None), "rag"),
-                        bounded_branch(
-                            web_task,
-                            RAG_VOICE_WEB_TIMEOUT_SECONDS,
-                            web_fallback if needs_web else None,
-                            "web",
-                        ),
                     )
                     # A fast retrieval no longer needs its delayed spoken
                     # filler. Cancel it before releasing the context to the LLM
@@ -1356,28 +1254,12 @@ class ContextRetrievalProcessor(FrameProcessor):
 
                     for content in (memory_context, rag_context):
                         if content:
-                            message = {"role": "developer", "content": content}
+                            message = {
+                                "role": "developer",
+                                "content": f"{QUERY_SCOPED_CONTEXT_MARKER}\n{content}",
+                            }
                             self._context.add_message(message)
                             self._dynamic_messages.append(message)
-                    if needs_web and web_payload is not None:
-                        web_context = (
-                            "Live web search result for the current user request. "
-                            "Use this result directly, be concise, and mention when live data was unavailable:\n"
-                            + json.dumps(web_payload, default=str)
-                        )
-                        message = {"role": "developer", "content": web_context}
-                        self._context.add_message(message)
-                        self._dynamic_messages.append(message)
-                        self._web_search_resolved = True
-                        if self._latency_state:
-                            self._latency_state.mark_stage("tool_finished")
-                    if needs_web:
-                        await self._finish_web_tool(
-                            tool_call_id,
-                            web_payload,
-                            "completed" if web_payload is not None else "failed",
-                            direction,
-                        )
                     if rag_payload:
                         if self._latency_state:
                             self._latency_state.rag_used = True
@@ -1405,7 +1287,7 @@ class ContextRetrievalProcessor(FrameProcessor):
 
             # The deadline covers provider work, context installation, and
             # release of the completed-turn context frame.
-            route_deadline = self._route_deadline(needs_memory, needs_rag, needs_web)
+            route_deadline = self._route_deadline(needs_memory, needs_rag)
             await asyncio.wait_for(
                 retrieve_and_deliver(),
                 timeout=route_deadline,
@@ -1413,7 +1295,7 @@ class ContextRetrievalProcessor(FrameProcessor):
         except TimeoutError:
             logger.warning(
                 "voice_retrieval status=timeout budget_ms={} query={!r}",
-                round(self._route_deadline(needs_memory, needs_rag, needs_web) * 1000), combined_query[:120],
+                round(self._route_deadline(needs_memory, needs_rag) * 1000), combined_query[:120],
             )
         except asyncio.CancelledError:
             logger.info(
@@ -1421,7 +1303,6 @@ class ContextRetrievalProcessor(FrameProcessor):
                 generation,
                 combined_query[:120],
             )
-            await self._finish_web_tool(tool_call_id, None, "cancelled", direction)
             raise
         except Exception as e:
             logger.error(f"Context retrieval error: {e}")
@@ -1431,23 +1312,25 @@ class ContextRetrievalProcessor(FrameProcessor):
                 round((time.monotonic() - started) * 1000, 1), needs_rag, needs_memory, combined_query[:120],
             )
             if not delivered and self._is_current_generation(generation):
-                await self._finish_web_tool(tool_call_id, None, "failed", direction)
                 await self.push_frame(frame, direction)
 
     def clear_dynamic_context(self):
         if self._dynamic_messages:
             ids = {id(message) for message in self._dynamic_messages}
+            previous_length = len(self._context.messages)
             self._context.messages[:] = [message for message in self._context.messages if id(message) not in ids]
             self._dynamic_messages.clear()
+            if (
+                self._mutation_epoch
+                and len(self._context.messages) != previous_length
+            ):
+                self._mutation_epoch.bump("query_scoped_context_cleared")
 
     def start_user_turn(self) -> None:
         """Reset query-scoped state at the aggregator's authoritative boundary."""
         self._supersede_active_retrieval()
         self.clear_dynamic_context()
-        self._web_search_resolved = False
-        self._web_search_attempted = False
         self._tool_filler_emitted = False
-        self._active_web_call_id = None
 
     def finish_response(self):
         # Response completion is not a user-turn boundary: an interrupted old
@@ -1459,7 +1342,7 @@ class ContextRetrievalProcessor(FrameProcessor):
         self._supersede_active_retrieval()
         if task:
             await asyncio.gather(task, return_exceptions=True)
-        self._cancel_proactive_filler()
+        self._cancel_rag_filler()
         await super().cleanup()
 
 

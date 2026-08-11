@@ -2677,9 +2677,8 @@ dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "bcrypt" },
-    { name = "crawl4ai" },
-    { name = "docling" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "loguru" },
     { name = "mlx-whisper" },
     { name = "moonshine-voice" },
@@ -2698,8 +2697,14 @@ dependencies = [
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "torchvision", version = "0.28.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.28.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
-    { name = "trafilatura" },
     { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+rag-worker = [
+    { name = "crawl4ai" },
+    { name = "docling" },
+    { name = "trafilatura" },
 ]
 
 [package.dev-dependencies]
@@ -2714,9 +2719,10 @@ requires-dist = [
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "bcrypt" },
-    { name = "crawl4ai" },
-    { name = "docling" },
+    { name = "crawl4ai", marker = "extra == 'rag-worker'" },
+    { name = "docling", marker = "extra == 'rag-worker'" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "loguru" },
     { name = "mlx-whisper", specifier = ">=0.4.3,<0.5" },
     { name = "moonshine-voice", specifier = ">=0.1,<0.2" },
@@ -2733,9 +2739,10 @@ requires-dist = [
     { name = "tavily-python" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "trafilatura" },
+    { name = "trafilatura", marker = "extra == 'rag-worker'" },
     { name = "uvicorn" },
 ]
+provides-extras = ["rag-worker"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

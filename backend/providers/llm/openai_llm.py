@@ -26,13 +26,13 @@ class LatencyBoundOpenAILLMService(OpenAILLMService):
         )
 
 
-def get_openai_llm():
+def get_openai_llm(*, system_instruction: str | None = None):
     """Build the sole OpenAI service used by a voice pipeline."""
     return LatencyBoundOpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=LatencyBoundOpenAILLMService.Settings(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            system_instruction=load_system_prompt(),
+            system_instruction=system_instruction or load_system_prompt(),
         ),
         function_call_timeout_secs=tool_timeout_seconds(),
         enable_async_tool_cancellation=True,

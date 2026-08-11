@@ -172,7 +172,7 @@ class LatencyBoundGoogleLLMService(GoogleLLMService):
         )
 
 
-def get_google_llm():
+def get_google_llm(*, system_instruction: str | None = None):
     timeout_secs = first_token_timeout_seconds()
     return LatencyBoundGoogleLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
@@ -180,7 +180,7 @@ def get_google_llm():
         timeout_message=timeout_recovery_text(),
         settings=GoogleLLMService.Settings(
             model=os.getenv("GOOGLE_MODEL", "gemini-3.1-flash-lite"),
-            system_instruction=load_system_prompt(),
+            system_instruction=system_instruction or load_system_prompt(),
             thinking=GoogleLLMService.ThinkingConfig(
                 thinking_level=os.getenv("GOOGLE_THINKING_LEVEL", "minimal"),
                 include_thoughts=False

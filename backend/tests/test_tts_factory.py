@@ -94,12 +94,20 @@ def test_kokoro_failure_does_not_fall_back_to_piper(monkeypatch):
 async def test_factory_warms_and_stops_selected_kokoro_runtime(monkeypatch):
     calls = []
 
+    def warm_adapter():
+        calls.append("adapter")
+
     async def warm():
         calls.append("warm")
 
     async def shutdown():
         calls.append("shutdown")
 
+    monkeypatch.setitem(
+        sys.modules,
+        "providers.tts.kokoro_tts",
+        SimpleNamespace(warm_kokoro_adapter=warm_adapter),
+    )
     monkeypatch.setitem(
         sys.modules,
         "providers.tts.kokoro_runtime",
@@ -113,7 +121,7 @@ async def test_factory_warms_and_stops_selected_kokoro_runtime(monkeypatch):
     await warm_tts_provider()
     await shutdown_tts_provider()
 
-    assert calls == ["warm", "shutdown"]
+    assert calls == ["adapter", "warm", "shutdown"]
 
 
 @pytest.mark.anyio

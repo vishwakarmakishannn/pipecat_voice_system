@@ -25,10 +25,20 @@ def memory_embedding_provider() -> str:
     return provider
 
 
+def memory_llm_provider() -> str:
+    provider = os.getenv(
+        "MEMORY_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "google")
+    ).strip().lower()
+    if provider not in {"google", "groq", "local", "openai", "disabled"}:
+        raise ValueError(
+            "MEMORY_LLM_PROVIDER must be google, groq, local, openai, or "
+            f"disabled; got {provider!r}"
+        )
+    return provider
+
+
 RECENT_MESSAGE_LIMIT = env_int("RECENT_MESSAGE_LIMIT", 20)
 PRIOR_CONVERSATION_MESSAGE_LIMIT = env_int("PRIOR_CONVERSATION_MESSAGE_LIMIT", 10)
-SUMMARY_MESSAGE_THRESHOLD = env_int("SUMMARY_MESSAGE_THRESHOLD", 20)
-SUMMARY_CHAR_THRESHOLD = env_int("SUMMARY_CHAR_THRESHOLD", 4000)
 MEMORY_LLM_TIMEOUT_SECONDS = env_float("MEMORY_LLM_TIMEOUT_SECONDS", 4.0)
 MEMORY_FACT_CONFIDENCE_MIN = env_float("MEMORY_FACT_CONFIDENCE_MIN", 0.85)
 MEMORY_RECALL_TOP_K = env_int("MEMORY_RECALL_TOP_K", 5)

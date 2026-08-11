@@ -60,6 +60,21 @@ services:
       start_period: 5m
     restart: unless-stopped
 
+  rag-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: rag-runtime
+    container_name: pipecat_rag_worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-pipecat_user}:${POSTGRES_PASSWORD:-pipecat_password}@db:5432/${POSTGRES_DB:-pipecat_db}
+    env_file:
+      - .env
+    restart: unless-stopped
+
   frontend:
     build:
       context: ./frontend

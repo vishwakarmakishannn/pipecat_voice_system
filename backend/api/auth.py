@@ -1,7 +1,10 @@
+import asyncio
 import os
 import jwt
+import time
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -20,6 +23,57 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 
 security = HTTPBearer()
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+class AuthRateLimiter:
+    """Bound auth attempts per client/username without blocking the event loop."""
+
+    def __init__(
+        self,
+        attempts: int | None = None,
+        window_seconds: float | None = None,
+        max_keys: int = 10_000,
+    ):
+        self.attempts = (
+            int(os.getenv("AUTH_RATE_LIMIT_ATTEMPTS", "8"))
+            if attempts is None
+            else attempts
+        )
+        self.window_seconds = (
+            float(os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "60"))
+            if window_seconds is None
+            else window_seconds
+        )
+        if self.attempts < 1 or self.window_seconds <= 0 or max_keys < 1:
+            raise ValueError("Auth rate-limit values must be positive")
+        self.max_keys = max_keys
+        self._buckets: OrderedDict[str, deque[float]] = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def check(self, action: str, request: Request, username: str) -> None:
+        client_host = request.client.host if request.client else "unknown"
+        key = f"{action}:{client_host}:{username.strip().lower()}"
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        async with self._lock:
+            bucket = self._buckets.pop(key, deque())
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.attempts:
+                retry_after = max(1, int(self.window_seconds - (now - bucket[0])))
+                self._buckets[key] = bucket
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many authentication attempts; retry later",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            bucket.append(now)
+            self._buckets[key] = bucket
+            while len(self._buckets) > self.max_keys:
+                self._buckets.popitem(last=False)
+
+
+auth_rate_limiter = AuthRateLimiter()
 
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9_]+$")
@@ -51,6 +105,14 @@ def get_password_hash(password):
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
+
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)
+
+
+async def get_password_hash_async(password: str) -> str:
+    return await asyncio.to_thread(get_password_hash, password)
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -75,12 +137,17 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     return user
 
 @router.post("/register", response_model=Token)
-async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+async def register(
+    user_data: UserCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await auth_rate_limiter.check("register", request, user_data.username)
     result = await db.execute(select(User).where(User.username == user_data.username))
     if result.scalars().first():
         raise HTTPException(status_code=400, detail="Username already registered")
     
-    hashed_password = get_password_hash(user_data.password)
+    hashed_password = await get_password_hash_async(user_data.password)
     new_user = User(username=user_data.username, password_hash=hashed_password)
     db.add(new_user)
     await db.commit()
@@ -90,10 +157,17 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.post("/login", response_model=Token)
-async def login(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+async def login(
+    user_data: UserCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await auth_rate_limiter.check("login", request, user_data.username)
     result = await db.execute(select(User).where(User.username == user_data.username))
     user = result.scalars().first()
-    if not user or not verify_password(user_data.password, user.password_hash):
+    if not user or not await verify_password_async(
+        user_data.password, user.password_hash
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
     
     access_token = create_access_token(data={"sub": user.username})

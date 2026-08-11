@@ -899,7 +899,8 @@
   color: #166534;
 }
 
-.file-status.processing {
+.file-status.processing,
+.file-status.queued {
   background: #fef3c7;
   color: #92400e;
 }
@@ -1026,6 +1027,22 @@
 .tool-call-header:hover {
   background-color: #e2e8f0;
 }
+
+.tool-call-status {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #475569;
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1.4;
+  text-transform: capitalize;
+}
+
+.tool-call-status-completed { background: #dcfce7; color: #166534; }
+.tool-call-status-in_progress { background: #dbeafe; color: #1d4ed8; }
+.tool-call-status-cancelled { background: #fee2e2; color: #991b1b; }
 
 .tool-call-body {
   padding: 12px;
@@ -1202,7 +1219,7 @@
 }
 
 :root[data-theme='dark'] .transcript-role,
-:root[data-theme='dark'] .tool-call-header span,
+:root[data-theme='dark'] .tool-call-header > span:not(.tool-call-status),
 :root[data-theme='dark'] .tool-call-section strong,
 :root[data-theme='dark'] .chunk-inspector-title,
 :root[data-theme='dark'] .chunk-card-header strong,
@@ -1210,6 +1227,43 @@
 :root[data-theme='dark'] .chunk-vector code,
 :root[data-theme='dark'] .chunk-pagination button {
   color: var(--text-main) !important;
+}
+
+:root[data-theme='dark'] .tool-call-block {
+  background: var(--surface-raised);
+  border-color: var(--border-color);
+}
+
+:root[data-theme='dark'] .tool-call-body pre {
+  color: #cbd5e1;
+}
+
+:root[data-theme='dark'] .tool-call-section + .tool-call-section {
+  border-color: var(--border-color) !important;
+}
+
+:root[data-theme='dark'] .tool-call-status {
+  background: #334155;
+  color: #e2e8f0;
+  border: 1px solid #475569;
+}
+
+:root[data-theme='dark'] .tool-call-status-completed {
+  background: rgba(34, 197, 94, 0.16);
+  color: #86efac;
+  border-color: rgba(74, 222, 128, 0.42);
+}
+
+:root[data-theme='dark'] .tool-call-status-in_progress {
+  background: rgba(59, 130, 246, 0.18);
+  color: #93c5fd;
+  border-color: rgba(96, 165, 250, 0.45);
+}
+
+:root[data-theme='dark'] .tool-call-status-cancelled {
+  background: rgba(239, 68, 68, 0.18);
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.45);
 }
 
 :root[data-theme='dark'] .tool-call-body,
@@ -1338,7 +1392,8 @@
   color: #6ee7b7;
 }
 
-:root[data-theme='dark'] .file-status.processing {
+:root[data-theme='dark'] .file-status.processing,
+:root[data-theme='dark'] .file-status.queued {
   background: rgba(251, 191, 36, 0.14);
   color: #fcd34d;
 }

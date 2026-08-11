@@ -15,7 +15,6 @@ from core.models import RagChunk, RagFile, User
 from services.rag import (
     delete_rag_file_record,
     normalize_pdf_filename,
-    process_rag_file,
     retrieve_rag_chunks,
     validate_public_http_url,
 )
@@ -177,7 +176,7 @@ async def upload_file(
         mime_type=file.content_type or "application/pdf",
         source_type="pdf",
         size_bytes=len(data),
-        status="processing",
+        status="queued",
     )
     db.add(rag_file)
     await db.flush()
@@ -190,8 +189,6 @@ async def upload_file(
     await db.commit()
     await db.refresh(rag_file)
 
-    from core.task_queue import task_queue
-    task_queue.enqueue(process_rag_file, rag_file.id)
     return _file_response(rag_file, 0)
 
 
@@ -216,14 +213,12 @@ async def add_link(
         final_url=url,
         site_name=url,
         size_bytes=0,
-        status="processing",
+        status="queued",
     )
     db.add(rag_file)
     await db.commit()
     await db.refresh(rag_file)
 
-    from core.task_queue import task_queue
-    task_queue.enqueue(process_rag_file, rag_file.id)
     return _file_response(rag_file, 0)
 
 

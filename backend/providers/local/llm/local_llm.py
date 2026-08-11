@@ -1,10 +1,12 @@
 """Pipecat LLM service backed by a local OpenAI-compatible llama.cpp server."""
 
 import asyncio
+import inspect
 import time
 import uuid
 
 from loguru import logger
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openai.llm import OpenAILLMService
 
 from core.llm_config import first_token_timeout_seconds, total_timeout_seconds
@@ -18,6 +20,13 @@ from providers.llm.stream_timeout import (
 
 from .config import LocalLLMConfig, load_local_llm_config
 from .runtime import LocalLLMRuntime, get_local_llm_runtime
+
+
+_MAX_AUTOMATIC_CONTINUATIONS = 2
+_CONTINUATION_INSTRUCTION = (
+    "Continue the assistant answer exactly where it stopped. Finish it concisely "
+    "without repeating any text and without calling a tool."
+)
 
 
 def _value(value, *names):
@@ -42,7 +51,51 @@ def _chunk_metrics(chunk) -> dict:
     timings = _value(model_extra, "timings")
     if timings:
         values["server_timings"] = timings
+    finish_reasons = [
+        getattr(choice, "finish_reason", None)
+        for choice in (getattr(chunk, "choices", None) or [])
+    ]
+    finish_reasons = [reason for reason in finish_reasons if reason is not None]
+    if finish_reasons:
+        values["finish_reason"] = finish_reasons[-1]
     return values
+
+
+def _chunk_content(chunk) -> str:
+    parts = []
+    for choice in getattr(chunk, "choices", None) or []:
+        delta = getattr(choice, "delta", None)
+        content = getattr(delta, "content", None) if delta else None
+        if content:
+            parts.append(content)
+    return "".join(parts)
+
+
+def _chunk_has_tool_call(chunk) -> bool:
+    for choice in getattr(chunk, "choices", None) or []:
+        delta = getattr(choice, "delta", None)
+        if delta and (
+            getattr(delta, "tool_calls", None)
+            or getattr(delta, "function_call", None)
+        ):
+            return True
+    return False
+
+
+def _chunk_hit_length_limit(chunk) -> bool:
+    return any(
+        str(getattr(choice, "finish_reason", "")).lower() == "length"
+        for choice in (getattr(chunk, "choices", None) or [])
+    )
+
+
+async def _close_stream(stream) -> None:
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 class LocalLLMService(OpenAILLMService):
@@ -81,6 +134,51 @@ class LocalLLMService(OpenAILLMService):
         else:
             await asyncio.wait_for(self._runtime.warm(), timeout=timeout_seconds)
         return True
+
+    async def _complete_truncated_response(self, initial_stream, context: LLMContext):
+        """Stream a response and transparently finish provider-truncated text."""
+        stream = initial_stream
+        complete_text = ""
+        continuation_count = 0
+
+        while True:
+            hit_length_limit = False
+            emitted_tool_call = False
+            try:
+                async for chunk in stream:
+                    complete_text += _chunk_content(chunk)
+                    emitted_tool_call = emitted_tool_call or _chunk_has_tool_call(chunk)
+                    hit_length_limit = hit_length_limit or _chunk_hit_length_limit(chunk)
+                    yield chunk
+            finally:
+                await _close_stream(stream)
+
+            if not hit_length_limit or emitted_tool_call or not complete_text.strip():
+                return
+            if continuation_count >= _MAX_AUTOMATIC_CONTINUATIONS:
+                logger.error(
+                    "voice_llm provider=local status=continuation_limit_reached "
+                    "continuations={} partial_chars={}",
+                    continuation_count,
+                    len(complete_text),
+                )
+                return
+
+            continuation_count += 1
+            logger.warning(
+                "voice_llm provider=local status=length_limited "
+                "action=continue continuation={} partial_chars={}",
+                continuation_count,
+                len(complete_text),
+            )
+            continuation_context = LLMContext(
+                messages=[
+                    *list(context.messages),
+                    {"role": "assistant", "content": complete_text},
+                    {"role": "user", "content": _CONTINUATION_INSTRUCTION},
+                ]
+            )
+            stream = await super().get_chat_completions(continuation_context)
 
     @staticmethod
     async def _instrumented_stream(
@@ -155,8 +253,9 @@ class LocalLLMService(OpenAILLMService):
             ) from exc
 
         elapsed = time.monotonic() - started
+        completion_safe_stream = self._complete_truncated_response(stream, context)
         bounded_stream = bounded_openai_stream(
-            stream,
+            completion_safe_stream,
             max(0.001, first_timeout - elapsed),
             max(0.001, total_timeout - elapsed),
         )
@@ -169,22 +268,30 @@ class LocalLLMService(OpenAILLMService):
         )
 
 
-def get_local_llm() -> LocalLLMService:
+def get_local_llm(*, system_instruction: str | None = None) -> LocalLLMService:
+    from core.admission import current_voice_slot_id
+
     config = load_local_llm_config()
     runtime = get_local_llm_runtime(config)
+    extra_body = dict(config.extra_body)
+    slot_id = current_voice_slot_id.get()
+    if slot_id is not None:
+        # llama.cpp prompt caches are slot-local. Keep every turn in this
+        # voice session on its reserved slot so the growing prefix is reused.
+        extra_body["id_slot"] = slot_id
     return LocalLLMService(
         runtime=runtime,
         config=config,
         settings=LocalLLMService.Settings(
             model=config.model,
-            system_instruction=load_system_prompt(),
+            system_instruction=system_instruction or load_system_prompt(),
             temperature=config.temperature,
             top_p=config.top_p,
             presence_penalty=config.presence_penalty,
             max_tokens=config.max_tokens,
             extra={
                 "parallel_tool_calls": False,
-                "extra_body": config.extra_body,
+                "extra_body": extra_body,
             },
         ),
         function_call_timeout_secs=tool_timeout_seconds(),

@@ -56,6 +56,7 @@ class KokoroConfig:
     low_latency_enabled: bool
     warmup_enabled: bool
     first_chunk_chars: int
+    first_chunk_min_words: int
     chunk_chars: int
     min_chunk_words: int
     intra_op_threads: int
@@ -215,6 +216,9 @@ def load_kokoro_config() -> KokoroConfig:
         warmup_enabled=_boolean("KOKORO_WARMUP_ENABLED", True),
         first_chunk_chars=_bounded_int(
             "KOKORO_FIRST_CHUNK_CHARS", 12, minimum=8, maximum=200
+        ),
+        first_chunk_min_words=_bounded_int(
+            "KOKORO_FIRST_CHUNK_MIN_WORDS", 1, minimum=1, maximum=20
         ),
         chunk_chars=_bounded_int(
             "KOKORO_CHUNK_CHARS", 80, minimum=16, maximum=500

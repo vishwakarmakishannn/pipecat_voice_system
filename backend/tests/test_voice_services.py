@@ -33,19 +33,16 @@ async def test_voice_service_constructors_are_scheduled_together(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_session_identity_and_services_start_concurrently(monkeypatch):
-    services_started = asyncio.Event()
-    session_started = asyncio.Event()
+async def test_session_is_authenticated_before_services_are_constructed(monkeypatch):
+    events = []
 
     async def fake_services(*_factories):
-        services_started.set()
-        await asyncio.wait_for(session_started.wait(), timeout=0.2)
+        events.append("services")
         return "stt", "tts", "llm"
 
     async def load_session(body):
         assert body == {"token": "x"}
-        session_started.set()
-        await asyncio.wait_for(services_started.wait(), timeout=0.2)
+        events.append("session")
         return "session"
 
     monkeypatch.setattr(voice_services, "initialize_voice_services", fake_services)
@@ -56,3 +53,72 @@ async def test_session_identity_and_services_start_concurrently(monkeypatch):
 
     assert services == ("stt", "tts", "llm")
     assert session == "session"
+    assert events == ["session", "services"]
+
+
+@pytest.mark.anyio
+async def test_invalid_session_does_not_construct_providers(monkeypatch):
+    constructed = False
+
+    async def fake_services(*_factories):
+        nonlocal constructed
+        constructed = True
+
+    async def reject_session(_body):
+        return None
+
+    monkeypatch.setattr(voice_services, "initialize_voice_services", fake_services)
+
+    with pytest.raises(
+        voice_services.VoiceSessionAuthenticationError,
+        match="authenticated voice session token",
+    ):
+        await voice_services.initialize_voice_runtime(
+            lambda: None,
+            lambda: None,
+            lambda: None,
+            reject_session,
+            {},
+        )
+
+    assert constructed is False
+
+
+@pytest.mark.anyio
+async def test_hydrated_session_builds_bound_llm_while_stt_and_tts_overlap(
+    monkeypatch,
+):
+    events = []
+
+    async def fake_construct(name, factory):
+        events.append(f"start:{name}")
+        value = factory()
+        events.append(f"done:{name}")
+        return value
+
+    async def load_session(_body):
+        events.append("authenticated")
+        return "base-session"
+
+    async def hydrate(session):
+        assert session == "base-session"
+        events.append("hydrated")
+        return "hydrated-session"
+
+    monkeypatch.setattr(voice_services, "_construct_voice_service", fake_construct)
+
+    services, session = await voice_services.initialize_voice_runtime(
+        lambda: "stt",
+        lambda: "tts",
+        lambda: "unbound-llm",
+        load_session,
+        {},
+        session_hydrator=hydrate,
+        session_llm_factory=lambda hydrated: f"llm:{hydrated}",
+    )
+
+    assert services == ("stt", "tts", "llm:hydrated-session")
+    assert session == "hydrated-session"
+    assert events[0] == "authenticated"
+    assert "hydrated" in events
+    assert events.index("hydrated") < events.index("start:llm")

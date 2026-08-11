@@ -127,6 +127,45 @@ async def test_tool_lifecycle_is_sent_to_ui_with_result(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_timeout_lifecycle_is_sent_to_ui_as_completed_with_result(monkeypatch):
+    frames = []
+    processor = ToolFillerProcessor(delay_seconds=1, enabled=False)
+
+    async def capture(frame, _direction):
+        frames.append(frame)
+
+    monkeypatch.setattr(processor, "push_frame", capture)
+    arguments = {"query": "current news"}
+    timeout_result = {
+        "status": "timeout",
+        "message": "Web search timed out. Continue without live results.",
+    }
+
+    await processor.process_frame(
+        FunctionCallInProgressFrame("tavily_search", "timeout-call", arguments),
+        FrameDirection.DOWNSTREAM,
+    )
+    await processor.process_frame(
+        FunctionCallResultFrame(
+            "tavily_search",
+            "timeout-call",
+            arguments,
+            timeout_result,
+        ),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    messages = [
+        frame.message["data"]["payload"]
+        for frame in frames
+        if isinstance(frame, OutputTransportMessageFrame)
+        and frame.message["data"]["type"] == "tool_call"
+    ]
+    assert [message["status"] for message in messages] == ["in_progress", "completed"]
+    assert messages[-1]["result"] == timeout_result
+
+
+@pytest.mark.anyio
 async def test_default_configuration_never_queues_filler_ahead_of_answer(monkeypatch):
     frames = []
     state = TurnLatencyState(session_id="test")

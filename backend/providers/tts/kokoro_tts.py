@@ -36,6 +36,7 @@ class LowLatencyKokoroTTSService(TTSService):
         runtime: KokoroRuntime,
         low_latency_enabled: bool,
         first_chunk_chars: int,
+        first_chunk_min_words: int,
         chunk_chars: int,
         min_chunk_words: int,
         **kwargs,
@@ -54,6 +55,7 @@ class LowLatencyKokoroTTSService(TTSService):
         ):
             self._text_aggregator = KokoroTextAggregator(
                 first_chunk_chars=first_chunk_chars,
+                first_chunk_min_words=first_chunk_min_words,
                 chunk_chars=chunk_chars,
                 min_chunk_words=min_chunk_words,
             )
@@ -120,6 +122,12 @@ def get_kokoro_tts() -> LowLatencyKokoroTTSService:
         text_aggregation_mode=aggregation_mode,
         low_latency_enabled=config.low_latency_enabled,
         first_chunk_chars=config.first_chunk_chars,
+        first_chunk_min_words=config.first_chunk_min_words,
         chunk_chars=config.chunk_chars,
         min_chunk_words=config.min_chunk_words,
     )
+
+
+def warm_kokoro_adapter() -> None:
+    """Preload the per-session resampler implementation during startup."""
+    create_stream_resampler()

@@ -41,6 +41,22 @@ def validate_voice_provider_configuration() -> dict[str, str]:
     """Return selected providers or raise with a non-secret configuration error."""
     selected = {}
     errors = []
+    try:
+        from core.datetime_context import configured_timezone_name
+
+        configured_timezone_name()
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        from core.context_summary_config import load_voice_context_summary_config
+
+        summary_config = load_voice_context_summary_config()
+        if summary_config.enabled and not os.getenv("GROQ_API_KEY", "").strip():
+            errors.append(
+                "GROQ_API_KEY is not configured for live context summarization"
+            )
+    except ValueError as exc:
+        errors.append(str(exc))
     for component, config in _PROVIDERS.items():
         provider = os.getenv(config["env"], config["default"]).strip().lower()
         selected[component] = provider

@@ -119,7 +119,7 @@ class RagFile(Base):
     site_name = Column(Text, nullable=True)
     content_hash = Column(String, nullable=True)
     size_bytes = Column(Integer, nullable=False, default=0)
-    status = Column(String, nullable=False, default="processing")
+    status = Column(String, nullable=False, default="queued")
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
