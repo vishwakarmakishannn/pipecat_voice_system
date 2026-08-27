@@ -3,15 +3,31 @@ import asyncio
 import time
 import uuid
 from loguru import logger
-from openai import BadRequestError
+from openai import APIConnectionError, APIError, APIStatusError, BadRequestError, RateLimitError
 from pipecat.services.groq.llm import GroqLLMService, GroqLLMSettings
-from core.llm_config import first_token_timeout_seconds, total_timeout_seconds
+from core.llm_config import (
+    first_token_timeout_seconds,
+    groq_first_attempt_timeout_seconds,
+    groq_live_max_attempts,
+    llm_retry_reserve_seconds,
+    timeout_recovery_text,
+    total_timeout_seconds,
+)
+from .groq_runtime import (
+    get_shared_groq_client,
+    groq_runtime_warmed,
+    mark_groq_runtime_unwarmed,
+    warm_groq_runtime,
+)
 from core.prompt_config import load_system_prompt
 from core.tool_config import tool_timeout_seconds
 from .stream_timeout import (
-    LLMStreamDeadlineError,
     bounded_openai_stream,
     chunk_has_meaningful_output,
+    openai_recovery_stream,
+    prefetch_openai_first_output,
+    recovering_openai_stream,
+    report_llm_deadline,
 )
 
 
@@ -82,6 +98,10 @@ def _chunk_usage(chunk) -> dict:
     return {key: value for key, value in values.items() if value is not None}
 
 
+def _is_tool_call_validation_error(exc: BaseException) -> bool:
+    return "tool call validation failed" in str(exc).lower()
+
+
 class LatencyBoundGroqLLMService(GroqLLMService):
     # Groq's OpenAI-compatible endpoint accepts a broad message shape, but
     # Llama models do not reliably treat non-initial developer messages as
@@ -91,52 +111,32 @@ class LatencyBoundGroqLLMService(GroqLLMService):
     supports_developer_role = False
 
     def __init__(self, **kwargs):
+        self._runtime_api_key = kwargs.get("api_key")
+        self._runtime_base_url = kwargs.get("base_url")
         super().__init__(**kwargs)
-        self._connection_warmed = False
-        self._warmup_attempted = False
+        self._connection_warmed = groq_runtime_warmed(
+            api_key=self._runtime_api_key,
+            base_url=self._runtime_base_url,
+        )
+        self.diagnostic_callback = None
+
+    def create_client(self, api_key=None, base_url=None, **kwargs):
+        """Use the process pool with SDK retries disabled for live inference."""
+        del kwargs
+        return get_shared_groq_client(api_key=api_key, base_url=base_url)
 
     @property
     def connection_warmed(self) -> bool:
         return self._connection_warmed
 
     async def warm_connection(self, timeout_seconds: float | None = None) -> bool:
-        """Boundedly warm this service's authenticated HTTP connection."""
-        if self._connection_warmed:
-            return True
-        self._warmup_attempted = True
-        raw_timeout = os.getenv("GROQ_WARMUP_TIMEOUT_SECONDS", "1.5")
-        try:
-            timeout = float(raw_timeout) if timeout_seconds is None else timeout_seconds
-        except ValueError as exc:
-            raise ValueError(
-                f"GROQ_WARMUP_TIMEOUT_SECONDS must be a number, got {raw_timeout!r}"
-            ) from exc
-        if not 0.1 <= timeout <= 10.0:
-            raise ValueError(
-                "GROQ_WARMUP_TIMEOUT_SECONDS must be between 0.1 and 10.0, "
-                f"got {timeout}"
-            )
-
-        started = time.monotonic()
-        try:
-            await asyncio.wait_for(self._client.models.list(), timeout=timeout)
-        except Exception as exc:
-            logger.warning(
-                "voice_llm provider=groq model={} status=warmup_failed "
-                "latency_ms={} error_type={}",
-                self._settings.model,
-                round((time.monotonic() - started) * 1000, 1),
-                type(exc).__name__,
-            )
-            return False
-
-        self._connection_warmed = True
-        logger.info(
-            "voice_llm provider=groq model={} status=warmed latency_ms={}",
-            self._settings.model,
-            round((time.monotonic() - started) * 1000, 1),
+        """Warm the exact shared client used by live inference."""
+        del timeout_seconds  # Runtime owns the single configured warmup deadline.
+        self._connection_warmed = await warm_groq_runtime(
+            api_key=self._runtime_api_key,
+            base_url=self._runtime_base_url,
         )
-        return True
+        return self._connection_warmed
 
     @staticmethod
     async def _instrumented_stream(
@@ -204,9 +204,10 @@ class LatencyBoundGroqLLMService(GroqLLMService):
         """Apply deadlines at Pipecat's actual Groq request hook.
 
         Groq sometimes invents a tool name that was not included in the
-        request. Its API rejects the entire completion before streaming. Retry
-        that provider-specific validation failure once with tools disabled so
-        the user still receives a spoken answer.
+        request. Its API can reject the completion either as an HTTP error or
+        as an error event inside the stream. Retry that provider-specific
+        validation failure once with tools disabled so the user still receives
+        a spoken answer.
         """
         first_timeout = first_token_timeout_seconds()
         total_timeout = total_timeout_seconds()
@@ -214,7 +215,7 @@ class LatencyBoundGroqLLMService(GroqLLMService):
         request_id = uuid.uuid4().hex
         model = self._settings.model
         reasoning_effort = (self._settings.extra or {}).get("reasoning_effort")
-        cold_start = not self._connection_warmed
+        cold_start = not bool(getattr(self, "_connection_warmed", False))
         logger.info(
             "voice_llm request_id={} provider=groq model={} reasoning_effort={} "
             "cold_start={} status=started first_output_deadline_ms={} "
@@ -226,26 +227,189 @@ class LatencyBoundGroqLLMService(GroqLLMService):
             round(first_timeout * 1000),
             round(total_timeout * 1000),
         )
-        try:
-            stream = await asyncio.wait_for(
-                super().get_chat_completions(context), timeout=first_timeout
-            )
-        except BadRequestError as exc:
-            if "tool call validation failed" not in str(exc).lower():
-                raise
-            configured_tools = context.tools
-            logger.warning(
-                "voice_llm provider=groq status=invalid_tool_call action=retry_without_tools"
-            )
-            context.set_tools()
+        recovery_text = timeout_recovery_text()
+        loop = asyncio.get_running_loop()
+        first_deadline = loop.time() + first_timeout
+        reserve = min(llm_retry_reserve_seconds(), first_timeout / 3)
+        configured_tools = context.tools
+        configured_max_attempts = groq_live_max_attempts()
+        # Preserve one immediate provider-validation recovery for tool turns,
+        # without splitting ordinary direct-turn transport deadlines.
+        max_attempts = max(
+            configured_max_attempts,
+            2 if configured_tools else 1,
+        )
+        attempt_limit = (
+            min(groq_first_attempt_timeout_seconds(), first_timeout)
+            if configured_max_attempts > 1
+            else first_timeout
+        )
+        attempt_history: list[dict] = []
+        last_error: BaseException | None = None
+        tools_disabled = False
+        stream = None
+
+        for attempt in range(1, max_attempts + 1):
+            remaining = first_deadline - loop.time()
+            if remaining <= reserve:
+                break
+            timeout = remaining if attempt == max_attempts else min(attempt_limit, remaining - reserve)
+            attempt_started = time.monotonic()
+            attempt_deadline = loop.time() + timeout
+            phase = "stream_creation"
             try:
                 stream = await asyncio.wait_for(
-                    super().get_chat_completions(context), timeout=first_timeout
+                    super().get_chat_completions(context), timeout=max(0.001, timeout)
                 )
-            finally:
-                context.set_tools(configured_tools)
-        except TimeoutError as exc:
-            raise LLMStreamDeadlineError("Groq stream creation deadline exceeded") from exc
+                phase = "first_output"
+                first_output_remaining = min(first_deadline, attempt_deadline) - loop.time()
+                if first_output_remaining <= 0:
+                    raise TimeoutError
+                stream = await prefetch_openai_first_output(
+                    stream,
+                    first_output_remaining,
+                )
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "phase": phase,
+                        "outcome": "completed",
+                        "duration_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                    }
+                )
+                break
+            except asyncio.CancelledError:
+                if tools_disabled:
+                    context.set_tools(configured_tools)
+                raise
+            except BadRequestError as exc:
+                last_error = exc
+                retry_without_tools = (
+                    _is_tool_call_validation_error(exc)
+                    and not tools_disabled
+                    and attempt < max_attempts
+                )
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "phase": phase,
+                        "outcome": "invalid_tool_call" if retry_without_tools else "failed",
+                        "error_type": type(exc).__name__,
+                        "http_status": getattr(exc, "status_code", None),
+                        "duration_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                    }
+                )
+                if not retry_without_tools:
+                    if tools_disabled:
+                        context.set_tools(configured_tools)
+                    raise
+                logger.warning(
+                    "voice_llm request_id={} provider=groq attempt={} status=invalid_tool_call "
+                    "action=retry_without_tools remaining_ms={}",
+                    request_id,
+                    attempt,
+                    round(max(0, first_deadline - loop.time()) * 1000),
+                )
+                context.set_tools()
+                tools_disabled = True
+            except (TimeoutError, APIConnectionError, RateLimitError, APIStatusError) as exc:
+                last_error = exc
+                if isinstance(exc, (TimeoutError, APIConnectionError)):
+                    self._connection_warmed = False
+                    mark_groq_runtime_unwarmed(
+                        api_key=getattr(self, "_runtime_api_key", None),
+                        base_url=getattr(self, "_runtime_base_url", None),
+                    )
+                status_code = getattr(exc, "status_code", None)
+                retryable = isinstance(exc, (TimeoutError, APIConnectionError, RateLimitError)) or (
+                    isinstance(status_code, int) and status_code >= 500
+                )
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "phase": phase,
+                        "outcome": "timeout" if isinstance(exc, TimeoutError) else "failed",
+                        "error_type": type(exc).__name__,
+                        "http_status": status_code,
+                        "duration_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                    }
+                )
+                remaining_after = first_deadline - loop.time()
+                if not retryable or attempt >= max_attempts or remaining_after <= reserve:
+                    break
+                logger.warning(
+                    "voice_llm request_id={} provider=groq attempt={} status=retrying "
+                    "error_type={} remaining_ms={}",
+                    request_id,
+                    attempt,
+                    type(exc).__name__,
+                    round(max(0, remaining_after) * 1000),
+                )
+            except APIError as exc:
+                # Groq can accept the HTTP request and then report tool-call
+                # validation as an SSE error while the stream is being read.
+                # The OpenAI SDK surfaces that path as APIError rather than the
+                # BadRequestError used for an ordinary HTTP 400 response.
+                last_error = exc
+                retry_without_tools = (
+                    _is_tool_call_validation_error(exc)
+                    and not tools_disabled
+                    and attempt < max_attempts
+                )
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "phase": phase,
+                        "outcome": "invalid_tool_call" if retry_without_tools else "failed",
+                        "error_type": type(exc).__name__,
+                        "duration_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                    }
+                )
+                if not retry_without_tools:
+                    if tools_disabled:
+                        context.set_tools(configured_tools)
+                    raise
+                logger.warning(
+                    "voice_llm request_id={} provider=groq attempt={} status=invalid_tool_call "
+                    "source=stream action=retry_without_tools remaining_ms={}",
+                    request_id,
+                    attempt,
+                    round(max(0, first_deadline - loop.time()) * 1000),
+                )
+                context.set_tools()
+                tools_disabled = True
+            except Exception:
+                if tools_disabled:
+                    context.set_tools(configured_tools)
+                raise
+
+        if tools_disabled:
+            context.set_tools(configured_tools)
+
+        if stream is None:
+            if isinstance(last_error, RateLimitError):
+                terminal_code = "llm.rate_limited"
+            elif isinstance(last_error, APIConnectionError):
+                terminal_code = "llm.connection_failed"
+            elif isinstance(last_error, APIStatusError):
+                terminal_code = "llm.provider_unavailable"
+            else:
+                terminal_code = "llm.stream_creation_timeout"
+            report_llm_deadline(
+                self.diagnostic_callback,
+                code=terminal_code,
+                request_id=request_id,
+                duration_ms=round((time.monotonic() - started) * 1000, 1),
+                recovery_text=recovery_text,
+                details={
+                    "attempts": attempt_history,
+                    "attempt_count": len(attempt_history),
+                    "max_attempts": max_attempts,
+                    "phase": attempt_history[-1]["phase"] if attempt_history else "stream_creation",
+                    "last_error_type": type(last_error).__name__ if last_error else "TimeoutError",
+                },
+            )
+            return openai_recovery_stream(recovery_text, model)
         self._connection_warmed = True
         elapsed = time.monotonic() - started
         bounded_stream = bounded_openai_stream(
@@ -253,8 +417,16 @@ class LatencyBoundGroqLLMService(GroqLLMService):
             max(0.001, first_timeout - elapsed),
             max(0.001, total_timeout - elapsed),
         )
-        return self._instrumented_stream(
+        recovery_stream = recovering_openai_stream(
             bounded_stream,
+            recovery_text=recovery_text,
+            model=model,
+            request_id=request_id,
+            started_at=started,
+            diagnostic_callback=self.diagnostic_callback,
+        )
+        return self._instrumented_stream(
+            recovery_stream,
             request_id=request_id,
             model=model,
             reasoning_effort=reasoning_effort,
@@ -263,7 +435,7 @@ class LatencyBoundGroqLLMService(GroqLLMService):
         )
 
 def get_groq_llm(*, system_instruction: str | None = None):
-    model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
     return LatencyBoundGroqLLMService(
         api_key=os.getenv("GROQ_API_KEY"),
         settings=GroqLLMSettings(

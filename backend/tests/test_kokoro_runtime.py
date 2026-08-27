@@ -26,6 +26,7 @@ def _config(tmp_path, **overrides):
         intra_op_threads=4,
         inter_op_threads=1,
         allow_spinning=False,
+        max_workers=1,
         download_timeout_seconds=30.0,
     )
     return replace(config, **overrides)
@@ -129,6 +130,29 @@ async def test_runtime_serializes_concurrent_inference(tmp_path):
     )
 
     assert maximum_active == 1
+    await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_runtime_can_match_two_admitted_live_sessions(tmp_path):
+    config = _config(tmp_path, warmup_enabled=False, max_workers=2)
+    config.model_path.write_bytes(b"model")
+    config.voices_path.write_bytes(b"voices")
+    barrier = threading.Barrier(2)
+
+    class ConcurrentModel(FakeModel):
+        def create(self, text, **kwargs):
+            barrier.wait(timeout=1)
+            return super().create(text, **kwargs)
+
+    runtime = KokoroRuntime(config, model_factory=lambda received: ConcurrentModel())
+
+    import asyncio
+
+    await asyncio.gather(
+        runtime.synthesize("one", voice="af_heart", language="en-us"),
+        runtime.synthesize("two", voice="af_heart", language="en-us"),
+    )
     await runtime.close()
 
 

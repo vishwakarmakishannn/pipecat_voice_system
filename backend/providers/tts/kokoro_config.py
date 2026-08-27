@@ -62,6 +62,7 @@ class KokoroConfig:
     intra_op_threads: int
     inter_op_threads: int
     allow_spinning: bool
+    max_workers: int
     download_timeout_seconds: float
 
     @property
@@ -236,6 +237,9 @@ def load_kokoro_config() -> KokoroConfig:
             "KOKORO_INTER_OP_THREADS", 1, minimum=1, maximum=16
         ),
         allow_spinning=_boolean("KOKORO_ALLOW_SPINNING", False),
+        max_workers=_bounded_int(
+            "KOKORO_MAX_WORKERS", 1, minimum=1, maximum=4
+        ),
         download_timeout_seconds=_bounded_float(
             "KOKORO_DOWNLOAD_TIMEOUT_SECONDS",
             300.0,

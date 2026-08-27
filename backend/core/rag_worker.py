@@ -57,12 +57,30 @@ async def run_rag_worker(stop_event: asyncio.Event | None = None) -> None:
     """Poll the database-backed queue and process one CPU-heavy job at a time."""
     stop = stop_event or asyncio.Event()
     poll_seconds = max(0.1, float(os.getenv("RAG_WORKER_POLL_SECONDS", "1.0")))
+    recovery_seconds = max(
+        poll_seconds,
+        float(os.getenv("RAG_WORKER_RECOVERY_SECONDS", "30")),
+    )
     recovered = await recover_stale_rag_jobs()
+    next_recovery = asyncio.get_running_loop().time() + recovery_seconds
     logger.info("rag_worker status=started recovered_jobs={}", recovered)
     while not stop.is_set():
+        if asyncio.get_running_loop().time() >= next_recovery:
+            recovered = await recover_stale_rag_jobs()
+            if recovered:
+                logger.warning("rag_worker status=recovered jobs={}", recovered)
+            next_recovery = asyncio.get_running_loop().time() + recovery_seconds
         file_id = await claim_next_rag_job()
         if file_id is not None:
-            await process_rag_file(file_id)
+            try:
+                await process_rag_file(file_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "rag_worker status=job_crashed file_id={} action=continue",
+                    file_id,
+                )
             continue
         try:
             await asyncio.wait_for(stop.wait(), timeout=poll_seconds)

@@ -10,17 +10,6 @@ export function buildIceServers(env = import.meta.env) {
   const stunUrls = splitUrls(env?.VITE_STUN_URLS || 'stun:stun.l.google.com:19302');
   if (stunUrls.length) servers.push({ urls: stunUrls });
 
-  const turnUrls = splitUrls(env?.VITE_TURN_URLS);
-  if (turnUrls.length) {
-    if (!env?.VITE_TURN_USERNAME || !env?.VITE_TURN_CREDENTIAL) {
-      throw new Error('TURN URLs require VITE_TURN_USERNAME and VITE_TURN_CREDENTIAL');
-    }
-    servers.push({
-      urls: turnUrls,
-      username: env.VITE_TURN_USERNAME,
-      credential: env.VITE_TURN_CREDENTIAL,
-    });
-  }
   return servers;
 }
 

@@ -31,7 +31,7 @@ def test_context_summary_defaults_are_enabled_and_balanced(monkeypatch):
         40,
         24000,
     )
-    assert config.model == "llama-3.1-8b-instant"
+    assert config.model == "openai/gpt-oss-20b"
 
 
 def test_context_summary_model_falls_back_to_memory_model(monkeypatch):

@@ -60,7 +60,7 @@ def load_voice_context_summary_config() -> VoiceContextSummaryConfig:
         emergency_max_chars=_env_int("VOICE_CONTEXT_EMERGENCY_MAX_CHARS", 24000),
         model=os.getenv(
             "GROQ_CONTEXT_SUMMARY_MODEL",
-            os.getenv("GROQ_MEMORY_MODEL", "llama-3.1-8b-instant"),
+            os.getenv("GROQ_MEMORY_MODEL", "openai/gpt-oss-20b"),
         ).strip(),
     )
     errors: list[str] = []

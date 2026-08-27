@@ -81,10 +81,11 @@ class KokoroRuntime:
         self._closed = False
         self._load_lock = threading.RLock()
         self._warm_lock = asyncio.Lock()
-        # Serial inference avoids two call sessions oversubscribing the same
-        # four Apple performance cores and producing unpredictable tail latency.
+        # Match this to admitted real-time sessions. A single worker with two
+        # admitted calls silently queued one caller's first phrase behind an
+        # unrelated continuation.
         self._executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=config.max_workers,
             thread_name_prefix="kokoro-runtime",
         )
 
@@ -135,11 +136,12 @@ class KokoroRuntime:
             logger.info(
                 "voice_startup stage=model_loaded service=kokoro_tts "
                 "precision={} intra_op_threads={} inter_op_threads={} "
-                "allow_spinning={} duration_ms={}",
+                "allow_spinning={} max_workers={} duration_ms={}",
                 self.config.precision,
                 self.config.intra_op_threads,
                 self.config.inter_op_threads,
                 self.config.allow_spinning,
+                self.config.max_workers,
                 round((time.perf_counter() - started) * 1000, 1),
             )
             return self._model

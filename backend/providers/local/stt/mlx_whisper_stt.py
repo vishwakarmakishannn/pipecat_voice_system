@@ -267,4 +267,5 @@ def get_mlx_whisper_stt() -> MLXWhisperSTTService:
     return MLXWhisperSTTService(
         runtime=get_mlx_whisper_runtime(config),
         config=config,
+        audio_passthrough=True,
     )

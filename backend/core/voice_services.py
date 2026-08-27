@@ -77,7 +77,13 @@ async def initialize_voice_runtime(
         llm_task = asyncio.create_task(
             _construct_voice_service("llm", selected_llm_factory)
         )
-        services = tuple(await asyncio.gather(stt_task, tts_task, llm_task))
+        try:
+            services = tuple(await asyncio.gather(stt_task, tts_task, llm_task))
+        except BaseException as exc:
+            # The authenticated call exists before provider construction. Keep
+            # that identity attached so startup failures can be finalized.
+            setattr(exc, "voice_session", hydrated_session)
+            raise
         session = hydrated_session
     logger.info(
         "voice_startup stage=runtime_ready duration_ms={}",

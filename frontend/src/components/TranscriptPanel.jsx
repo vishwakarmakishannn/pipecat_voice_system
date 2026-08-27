@@ -1,5 +1,5 @@
-import { User, FileText, Wrench, ChevronDown, ChevronRight, Mic } from 'lucide-react';
-import { formatToolCallStatus, hasToolCallResult } from '../utils/toolCalls.js';
+import { AlertTriangle, User, FileText, Wrench, ChevronDown, ChevronRight, Mic } from 'lucide-react';
+import { formatToolCallStatus, getToolCallDisplayStatus, hasToolCallResult } from '../utils/toolCalls.js';
 
 export default function TranscriptPanel({
   transcripts,
@@ -19,25 +19,35 @@ export default function TranscriptPanel({
         <div className="transcript-list">
           {transcripts.map((item) => (
             <div className="transcript-item" key={item.id}>
-              <div className={`transcript-avatar ${item.role === 'You' ? 'user-avatar' : item.role === 'ToolCall' || item.role === 'RagCall' ? 'tool-avatar' : 'bot-avatar'}`}>
-                {item.role === 'You' ? <User size={18} strokeWidth={2.5} /> : item.role === 'ToolCall' ? <Wrench size={16} /> : item.role === 'RagCall' ? <FileText size={16} /> : 'A'}
+              <div className={`transcript-avatar ${item.role === 'You' ? 'user-avatar' : item.role === 'ToolCall' || item.role === 'RagCall' ? 'tool-avatar' : item.role === 'Error' ? 'error-avatar' : 'bot-avatar'}`}>
+                {item.role === 'You' ? <User size={18} strokeWidth={2.5} /> : item.role === 'ToolCall' ? <Wrench size={16} /> : item.role === 'RagCall' ? <FileText size={16} /> : item.role === 'Error' ? <AlertTriangle size={16} /> : 'A'}
               </div>
               <div className="transcript-message">
                 <div className="transcript-role">
-                  {item.role === 'Aura' ? 'Aura AI' : item.role === 'ToolCall' ? 'Tool Call' : item.role === 'RagCall' ? 'RAG Call' : item.role}
+                  {item.role === 'Aura' ? 'Aura AI' : item.role === 'ToolCall' ? 'Tool Call' : item.role === 'RagCall' ? 'RAG Call' : item.role === 'Error' ? 'Diagnostic' : item.role}
                   {item.timestamp && <span className="transcript-time">{item.timestamp}</span>}
                 </div>
-                {item.role === 'ToolCall' || item.role === 'RagCall' ? (() => {
+                {item.role === 'ToolCall' || item.role === 'RagCall' || item.role === 'Error' ? (() => {
                   let parsed;
                   try { parsed = JSON.parse(item.text); } catch { parsed = { function_name: 'Unknown', arguments: item.text }; }
+                  if (item.role === 'Error') return (
+                    <div className="diagnostic-block">
+                      <strong>{parsed.code || 'voice.error'}</strong>
+                      <span className={`status-pill ${parsed.outcome || 'failed'}`}>{parsed.outcome || 'failed'}</span>
+                      <p>{parsed.message || 'A voice component reported an error.'}</p>
+                      <button onClick={() => toggleToolCall(item.id)}>{expandedToolCalls[item.id] ? 'Hide details' : 'Show details'}</button>
+                      {expandedToolCalls[item.id] ? <pre>{JSON.stringify(parsed, null, 2)}</pre> : null}
+                    </div>
+                  );
+                  const displayStatus = getToolCallDisplayStatus(parsed);
                   return (
                     <div className="tool-call-block">
                       <div className="tool-call-header" onClick={() => toggleToolCall(item.id)}>
                         {expandedToolCalls[item.id] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                         <span style={{fontWeight: 500, color: '#475569'}}>{parsed.function_name}</span>
-                        {parsed.status && (
-                          <span className={`tool-call-status tool-call-status-${parsed.status}`}>
-                            {formatToolCallStatus(parsed.status)}
+                        {displayStatus && (
+                          <span className={`tool-call-status tool-call-status-${displayStatus}`}>
+                            {formatToolCallStatus(displayStatus)}
                           </span>
                         )}
                       </div>

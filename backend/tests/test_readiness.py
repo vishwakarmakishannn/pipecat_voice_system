@@ -1,6 +1,9 @@
 import pytest
 
-from core.readiness import validate_voice_provider_configuration
+from core.readiness import (
+    validate_voice_provider_configuration,
+    validate_voice_runtime_readiness,
+)
 
 
 def test_voice_provider_configuration_reports_selected_providers(monkeypatch):
@@ -17,6 +20,15 @@ def test_voice_provider_configuration_reports_selected_providers(monkeypatch):
     }
 
 
+def test_groq_runtime_readiness_requires_successful_warmup(monkeypatch):
+    monkeypatch.setattr(
+        "providers.llm.groq_runtime.groq_runtime_warmed", lambda: False
+    )
+
+    with pytest.raises(ValueError, match="warmup"):
+        validate_voice_runtime_readiness({"llm": "groq"})
+
+
 def test_kokoro_readiness_requires_no_tts_credential(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "groq")
     monkeypatch.setenv("GROQ_API_KEY", "secret")
@@ -27,6 +39,7 @@ def test_kokoro_readiness_requires_no_tts_credential(monkeypatch):
     monkeypatch.setenv("KOKORO_LANGUAGE", "en-US")
     monkeypatch.delenv("KOKORO_MODEL_PATH", raising=False)
     monkeypatch.delenv("KOKORO_VOICES_PATH", raising=False)
+    monkeypatch.setenv("VOICE_MAX_CONCURRENT_SESSIONS", "1")
 
     assert validate_voice_provider_configuration() == {
         "llm": "groq",
@@ -44,6 +57,7 @@ def test_kokoro_readiness_rejects_invalid_configuration(monkeypatch):
     monkeypatch.setenv("KOKORO_LANGUAGE", "unsupported")
     monkeypatch.delenv("KOKORO_MODEL_PATH", raising=False)
     monkeypatch.delenv("KOKORO_VOICES_PATH", raising=False)
+    monkeypatch.setenv("VOICE_MAX_CONCURRENT_SESSIONS", "1")
 
     with pytest.raises(ValueError, match="KOKORO_LANGUAGE"):
         validate_voice_provider_configuration()

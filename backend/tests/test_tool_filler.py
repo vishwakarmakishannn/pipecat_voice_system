@@ -1,16 +1,16 @@
 import asyncio
 
 import pytest
-from pipecat.frames.frames import FunctionCallInProgressFrame, FunctionCallResultFrame, OutputTransportMessageFrame, TTSSpeakFrame
+from pipecat.frames.frames import FunctionCallInProgressFrame, FunctionCallResultFrame, OutputTransportMessageUrgentFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection
 
 from core.processors import ToolFillerProcessor, TurnLatencyState
 
 
-def test_tool_filler_is_enabled_by_default(monkeypatch):
+def test_tool_filler_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VOICE_TOOL_FILLER_ENABLED", raising=False)
 
-    assert ToolFillerProcessor()._enabled is True
+    assert ToolFillerProcessor()._enabled is False
 
 
 @pytest.mark.anyio
@@ -47,7 +47,7 @@ async def test_slow_tool_gets_one_delayed_filler(monkeypatch):
     await asyncio.sleep(0.02)
 
     assert len([frame for frame in frames if isinstance(frame, TTSSpeakFrame)]) == 1
-    transcript_frames = [frame for frame in frames if isinstance(frame, OutputTransportMessageFrame)]
+    transcript_frames = [frame for frame in frames if isinstance(frame, OutputTransportMessageUrgentFrame)]
     assert any(
         frame.message["data"]["type"] == "assistant_transcript"
         and frame.message["data"]["payload"]["text"] == "Let me check that."
@@ -73,7 +73,7 @@ async def test_immediate_filler_precedes_tool_transcription(monkeypatch):
         FrameDirection.DOWNSTREAM,
     )
 
-    assert isinstance(frames[0], OutputTransportMessageFrame)
+    assert isinstance(frames[0], OutputTransportMessageUrgentFrame)
     assert frames[0].message["data"]["type"] == "assistant_transcript"
     assert isinstance(frames[1], TTSSpeakFrame)
     assert frames[2].message["data"]["type"] == "tool_call"
@@ -119,7 +119,7 @@ async def test_tool_lifecycle_is_sent_to_ui_with_result(monkeypatch):
     messages = [
         frame.message["data"]
         for frame in frames
-        if isinstance(frame, OutputTransportMessageFrame)
+        if isinstance(frame, OutputTransportMessageUrgentFrame)
         and frame.message["data"]["type"] == "tool_call"
     ]
     assert [message["payload"]["status"] for message in messages] == ["in_progress", "completed"]
@@ -158,7 +158,7 @@ async def test_timeout_lifecycle_is_sent_to_ui_as_completed_with_result(monkeypa
     messages = [
         frame.message["data"]["payload"]
         for frame in frames
-        if isinstance(frame, OutputTransportMessageFrame)
+        if isinstance(frame, OutputTransportMessageUrgentFrame)
         and frame.message["data"]["type"] == "tool_call"
     ]
     assert [message["status"] for message in messages] == ["in_progress", "completed"]

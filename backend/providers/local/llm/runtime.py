@@ -12,6 +12,8 @@ import httpx
 
 from core.prompt_config import load_system_prompt
 from tools.datetime_tool import openai_datetime_tool_schema
+from tools.rag import openai_rag_tool_schema
+from tools.raise_issue import openai_manage_issue_tool_schema
 from tools.tavily import openai_tavily_tool_schema
 
 from .config import LocalLLMConfig, load_local_llm_config
@@ -112,7 +114,7 @@ class LocalLLMRuntime:
                     },
                 ]
 
-                async def warm_slot() -> None:
+                async def warm_slot(slot_id: int) -> None:
                     await self.client.chat.completions.create(
                         model=self.config.model,
                         messages=warmup_messages,
@@ -121,10 +123,15 @@ class LocalLLMRuntime:
                         max_tokens=4,
                         tools=[
                             openai_datetime_tool_schema(),
+                            openai_rag_tool_schema(),
                             openai_tavily_tool_schema(),
+                            openai_manage_issue_tool_schema(),
                         ],
                         tool_choice="auto",
-                        extra_body=self.config.extra_body,
+                        extra_body={
+                            **self.config.extra_body,
+                            "id_slot": slot_id,
+                        },
                     )
 
                 # Prompt caches are slot-local in llama.cpp. Keep requests in
@@ -132,8 +139,10 @@ class LocalLLMRuntime:
                 # the production prefix before voice traffic begins.
                 await asyncio.gather(
                     *(
-                        warm_slot()
-                        for _ in range(self.config.max_concurrent_sessions)
+                        warm_slot(slot_id)
+                        for slot_id in range(
+                            self.config.max_concurrent_sessions
+                        )
                     )
                 )
 

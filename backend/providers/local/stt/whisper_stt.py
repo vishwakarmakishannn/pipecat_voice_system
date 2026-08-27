@@ -250,4 +250,5 @@ def get_whisper_stt() -> WhisperSTTService:
     return WhisperSTTService(
         runtime=get_whisper_runtime(config),
         config=config,
+        audio_passthrough=True,
     )

@@ -71,3 +71,55 @@ async def test_worker_claims_and_processes_before_stopping(monkeypatch):
     await rag_worker.run_rag_worker(stop)
 
     assert processed == [7]
+
+
+@pytest.mark.anyio
+async def test_worker_periodically_recovers_jobs_without_restart(monkeypatch):
+    stop = asyncio.Event()
+    recoveries = 0
+
+    async def recover():
+        nonlocal recoveries
+        recoveries += 1
+        if recoveries == 2:
+            stop.set()
+        return 1 if recoveries == 2 else 0
+
+    async def claim():
+        return None
+
+    monkeypatch.setenv("RAG_WORKER_POLL_SECONDS", "0.01")
+    monkeypatch.setenv("RAG_WORKER_RECOVERY_SECONDS", "0.01")
+    monkeypatch.setattr(rag_worker, "recover_stale_rag_jobs", recover)
+    monkeypatch.setattr(rag_worker, "claim_next_rag_job", claim)
+
+    await asyncio.wait_for(rag_worker.run_rag_worker(stop), timeout=0.3)
+
+    assert recoveries == 2
+
+
+@pytest.mark.anyio
+async def test_worker_contains_one_job_crash_and_processes_the_next(monkeypatch):
+    stop = asyncio.Event()
+    claims = iter([7, 8])
+    processed = []
+
+    async def recover():
+        return 0
+
+    async def claim():
+        return next(claims)
+
+    async def process(file_id):
+        processed.append(file_id)
+        if file_id == 7:
+            raise RuntimeError("broken job")
+        stop.set()
+
+    monkeypatch.setattr(rag_worker, "recover_stale_rag_jobs", recover)
+    monkeypatch.setattr(rag_worker, "claim_next_rag_job", claim)
+    monkeypatch.setattr(rag_worker, "process_rag_file", process)
+
+    await rag_worker.run_rag_worker(stop)
+
+    assert processed == [7, 8]

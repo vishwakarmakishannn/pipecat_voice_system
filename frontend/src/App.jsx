@@ -9,13 +9,16 @@ import {
   useRTVIClientEvent,
 } from '@pipecat-ai/client-react';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
-import { Mic, Moon, Send, Sun, Volume2, X } from 'lucide-react';
+import { ExternalLink, Mic, Moon, Send, Sun, Volume2, X } from 'lucide-react';
 import { jwtDecode } from 'jwt-decode';
+import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom';
 import { fetchWithAuth, API_BASE } from './utils/api';
 import { buildAudioConstraints, buildIceServers, localSpeechLevelThreshold, webRTCConnectTimeoutMs } from './utils/webrtc';
-import { collectWebRTCAudioStats, createSessionTelemetry, ensureBotAudioPlayback, monitorPeerConnection, publishSessionTelemetry, recordCaptureTrack, recordSelectedCandidatePair, withConnectionDeadline } from './utils/sessionTelemetry';
-import { hasPendingRagFiles } from './utils/ragFiles';
+import { collectWebRTCAudioStats, createSessionTelemetry, ensureBotAudioPlayback, monitorPeerConnection, monitorRemoteAudioTrack, publishSessionTelemetry, recordCaptureTrack, recordSelectedCandidatePair, withConnectionDeadline } from './utils/sessionTelemetry';
+import { addLatencySample } from './utils/liveLatency';
 import './App.css';
+import { CallDetailPage, CallsPage } from './components/CallPages';
+import { FilesPage, MemoriesPage } from './components/ResourcePages';
 
 const START_ENDPOINT =
   import.meta.env.VITE_PIPECAT_START_URL ||
@@ -35,12 +38,11 @@ function capTranscriptItems(items) {
 const Auth = lazy(() => import('./components/Auth'));
 const Sidebar = lazy(() => import('./components/Sidebar'));
 const TranscriptPanel = lazy(() => import('./components/TranscriptPanel'));
-const ChunkInspector = lazy(() => import('./components/ChunkInspector'));
 
-function createPipecatClient() {
+function createPipecatClient(iceServers = buildIceServers()) {
   return new PipecatClient({
     transport: new SmallWebRTCTransport({
-      iceServers: buildIceServers(),
+      iceServers,
       waitForICEGathering: false,
     }),
     enableMic: true,
@@ -59,6 +61,8 @@ function isValidTokenValue(token) {
 }
 
 function VoiceApp({ onResetClient }) {
+  const location = useLocation();
+  const navigate = useNavigate();
   const pcClient = usePipecatClient();
   const transportState = usePipecatClientTransportState();
   const { enableMic, isMicEnabled } = usePipecatClientMicControl();
@@ -67,24 +71,14 @@ function VoiceApp({ onResetClient }) {
   const [error, setError] = useState('');
   
   const [transcripts, setTranscripts] = useState([]);
-  const [conversations, setConversations] = useState([]);
-  const [currentConversationId, setCurrentConversationId] = useState(null);
-  
-  const [memories, setMemories] = useState([]);
-  const [isMemoryPanelOpen, setIsMemoryPanelOpen] = useState(false);
-  const [isMemoryLoading, setIsMemoryLoading] = useState(false);
-  const [memoryError, setMemoryError] = useState('');
-  
-  const [sidebarTab, setSidebarTab] = useState('chats');
-  const [ragFiles, setRagFiles] = useState([]);
-  const [isFilesLoading, setIsFilesLoading] = useState(false);
-  const [isUploadingFile, setIsUploadingFile] = useState(false);
-  const [isAddingLink, setIsAddingLink] = useState(false);
-  const [linkUrl, setLinkUrl] = useState('');
-  const [fileError, setFileError] = useState('');
-  const [inspectedFile, setInspectedFile] = useState(null);
-  
-  const currentConversationIdRef = React.useRef(null);
+  const [currentCallId, setCurrentCallId] = useState(null);
+  const [currentCallStatus, setCurrentCallStatus] = useState(null);
+  const [currentRecordingStatus, setCurrentRecordingStatus] = useState(null);
+  const [currentProviders, setCurrentProviders] = useState(null);
+  const [currentCallStartedAt, setCurrentCallStartedAt] = useState(null);
+  const [currentCallElapsed, setCurrentCallElapsed] = useState(0);
+
+  const currentCallIdRef = React.useRef(null);
   const transcriptAreaRef = React.useRef(null);
   const transcriptBottomRef = React.useRef(null);
   const shouldAutoScrollRef = React.useRef(true);
@@ -109,9 +103,11 @@ function VoiceApp({ onResetClient }) {
   const pendingLatencyRef = React.useRef(null);
   const sessionTelemetryRef = React.useRef(null);
   const stopPeerMonitorRef = React.useRef(null);
+  const stopRemoteAudioMonitorRef = React.useRef(null);
   
   const [expandedToolCalls, setExpandedToolCalls] = useState({});
   const [liveLatency, setLiveLatency] = useState(null);
+  const [latencySamples, setLatencySamples] = useState([]);
   const [isVoiceBusy, setIsVoiceBusy] = useState(false);
   const [textInput, setTextInput] = useState('');
   const [isSendingText, setIsSendingText] = useState(false);
@@ -120,6 +116,17 @@ function VoiceApp({ onResetClient }) {
     if (savedTheme === 'light' || savedTheme === 'dark') return savedTheme;
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   });
+
+  const reportClientEvent = useCallback((code, message, details = {}) => {
+    const callId = currentCallIdRef.current;
+    if (!callId) return;
+    void fetchWithAuth(`/api/calls/${callId}/client-events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, message, severity: 'error', details }),
+      timeoutMs: 2500,
+    }).catch((reportError) => console.warn('Could not persist client diagnostic', reportError));
+  }, []);
 
   React.useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -140,62 +147,52 @@ function VoiceApp({ onResetClient }) {
     return transportState.charAt(0).toUpperCase() + transportState.slice(1);
   }, [isConnecting, transportState]);
 
-  const fetchConversations = useCallback(async () => {
-    try {
-      const res = await fetchWithAuth(`/api/conversations`);
-      if (res.ok) setConversations(await res.json());
-    } catch (err) {
-      console.warn('Failed to fetch conversations', err);
-    }
-  }, []);
-
-  const fetchMemories = useCallback(async () => {
-    setIsMemoryLoading(true);
-    setMemoryError('');
-    try {
-      const res = await fetchWithAuth(`/api/memories`);
-      if (!res.ok) throw new Error('Could not load memories');
-      setMemories(await res.json());
-    } catch (err) {
-      setMemoryError(err?.message || 'Could not load memories');
-    } finally {
-      setIsMemoryLoading(false);
-    }
-  }, []);
-
-  const fetchFiles = useCallback(async () => {
-    setIsFilesLoading(true);
-    setFileError('');
-    try {
-      const res = await fetchWithAuth(`/api/files`);
-      if (!res.ok) throw new Error('Could not load files');
-      setRagFiles(await res.json());
-    } catch (err) {
-      setFileError(err?.message || 'Could not load files');
-    } finally {
-      setIsFilesLoading(false);
-    }
-  }, []);
+  React.useEffect(() => {
+    if (location.pathname === '/') navigate('/playground', { replace: true });
+  }, [location.pathname, navigate]);
 
   React.useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      fetchConversations();
-      fetchFiles();
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, [fetchConversations, fetchFiles]);
+    currentCallIdRef.current = currentCallId;
+  }, [currentCallId]);
 
   React.useEffect(() => {
-    if (sidebarTab !== 'files') return undefined;
-    if (isVoiceBusy) return undefined;
-    if (!hasPendingRagFiles(ragFiles)) return undefined;
-    const intervalId = window.setInterval(fetchFiles, 2500);
-    return () => window.clearInterval(intervalId);
-  }, [fetchFiles, isVoiceBusy, ragFiles, sidebarTab]);
+    if (!currentCallStartedAt || currentCallStatus !== 'active') return undefined;
+    const update = () => setCurrentCallElapsed(Math.max(0, Math.floor((Date.now() - Date.parse(currentCallStartedAt)) / 1000)));
+    const timer = window.setInterval(update, 1000);
+    const initial = window.setTimeout(update, 0);
+    return () => { window.clearInterval(timer); window.clearTimeout(initial); };
+  }, [currentCallStartedAt, currentCallStatus]);
 
   React.useEffect(() => {
-    currentConversationIdRef.current = currentConversationId;
-  }, [currentConversationId]);
+    if (!currentCallId || !['disconnected', 'initialized', 'error'].includes(transportState)) {
+      return undefined;
+    }
+    let cancelled = false;
+    let timer;
+    const refreshTerminalState = async () => {
+      try {
+        const response = await fetchWithAuth(`/api/calls/${currentCallId}`);
+        if (!response.ok || cancelled) return;
+        const call = await response.json();
+        setCurrentCallStatus(call.status);
+        if (call.duration_ms != null) {
+          setCurrentCallElapsed(Math.max(0, Math.floor(call.duration_ms / 1000)));
+        }
+        setCurrentRecordingStatus(call.recording?.status || null);
+        setCurrentProviders(call.providers || null);
+        if (!['completed', 'failed', 'cancelled', 'abandoned'].includes(call.status)) {
+          timer = window.setTimeout(refreshTerminalState, 750);
+        }
+      } catch {
+        if (!cancelled) timer = window.setTimeout(refreshTerminalState, 1000);
+      }
+    };
+    timer = window.setTimeout(refreshTerminalState, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentCallId, transportState]);
 
   React.useEffect(() => {
     if (!shouldAutoScrollRef.current) return;
@@ -213,150 +210,20 @@ function VoiceApp({ onResetClient }) {
     shouldAutoScrollRef.current = distanceFromBottom < 80;
   }, []);
 
-  const loadConversation = async (id) => {
+  const startNewCall = async () => {
     if (isActive) await disconnect();
-    currentConversationIdRef.current = id;
-    setCurrentConversationId(id);
-    shouldAutoScrollRef.current = true;
-    try {
-      const res = await fetchWithAuth(`/api/conversations/${id}/messages`);
-      if (res.ok) {
-        const msgs = await res.json();
-        setTranscripts(msgs.map(m => ({
-          id: m.id,
-          role: m.role,
-          text: m.content,
-          timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-        })));
-      }
-    } catch (err) {
-      console.warn('Failed to load conversation', err);
-    }
-  };
-
-  const deleteConversation = async (e, id) => {
-    e.stopPropagation();
-    try {
-      const res = await fetchWithAuth(`/api/conversations/${id}`, {
-        method: 'DELETE'
-      });
-      if (res.ok) {
-        if (currentConversationId === id) {
-          currentConversationIdRef.current = null;
-          setCurrentConversationId(null);
-          setTranscripts([]);
-        }
-        fetchConversations();
-      }
-    } catch (err) {
-      console.warn('Failed to delete conversation', err);
-    }
-  };
-
-  const toggleMemoryPanel = () => {
-    const nextOpen = !isMemoryPanelOpen;
-    setIsMemoryPanelOpen(nextOpen);
-    if (nextOpen) fetchMemories();
-  };
-
-  const deleteMemory = async (id) => {
-    try {
-      const res = await fetchWithAuth(`/api/memories/${id}`, {
-        method: 'DELETE'
-      });
-      if (!res.ok) throw new Error('Could not delete memory');
-      setMemories((items) => items.filter((memory) => memory.id !== id));
-    } catch (err) {
-      setMemoryError(err?.message || 'Could not delete memory');
-    }
-  };
-
-  const deleteAllMemories = async () => {
-    try {
-      const res = await fetchWithAuth(`/api/memories`, {
-        method: 'DELETE'
-      });
-      if (!res.ok) throw new Error('Could not delete memories');
-      setMemories([]);
-    } catch (err) {
-      setMemoryError(err?.message || 'Could not delete memories');
-    }
-  };
-
-  const uploadRagFile = async (event) => {
-    const file = event.target.files?.[0];
-    event.target.value = '';
-    if (!file) return;
-
-    setIsUploadingFile(true);
-    setFileError('');
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const res = await fetchWithAuth(`/api/files`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || 'Could not upload PDF');
-      }
-      await fetchFiles();
-    } catch (err) {
-      setFileError(err?.message || 'Could not upload PDF');
-    } finally {
-      setIsUploadingFile(false);
-    }
-  };
-
-  const addRagLink = async (event) => {
-    event.preventDefault();
-    const url = linkUrl.trim();
-    if (!url) return;
-
-    setIsAddingLink(true);
-    setFileError('');
-    try {
-      const res = await fetchWithAuth(`/api/files/link`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ url })
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || 'Could not add link');
-      }
-      setLinkUrl('');
-      await fetchFiles();
-    } catch (err) {
-      setFileError(err?.message || 'Could not add link');
-    } finally {
-      setIsAddingLink(false);
-    }
-  };
-
-  const deleteRagFile = async (id) => {
-    try {
-      const res = await fetchWithAuth(`/api/files/${id}`, {
-        method: 'DELETE'
-      });
-      if (!res.ok) throw new Error('Could not delete file');
-      setRagFiles((items) => items.filter((file) => file.id !== id));
-    } catch (err) {
-      setFileError(err?.message || 'Could not delete file');
-    }
-  };
-
-  const startNewConversation = async () => {
-    if (isActive) await disconnect();
-    currentConversationIdRef.current = null;
-    setCurrentConversationId(null);
+    currentCallIdRef.current = null;
+    setCurrentCallId(null);
+    setCurrentCallStatus(null);
+    setCurrentRecordingStatus(null);
+    setCurrentProviders(null);
+    setCurrentCallStartedAt(null);
+    setCurrentCallElapsed(0);
     setTranscripts([]);
     setTextInput('');
     shouldAutoScrollRef.current = true;
     setLiveLatency(null);
+    setLatencySamples([]);
   };
 
   const addTranscript = useCallback((role, text, isDelta = false, messageId = null) => {
@@ -491,19 +358,40 @@ function VoiceApp({ onResetClient }) {
           : 'server_turn_stop_event',
     };
 
-    const webrtcMetrics = await collectWebRTCAudioStats(pcClient?.transport).catch(() => null);
+    // Capture the media timestamp and release the turn immediately. Browser
+    // getStats() can be slow or hang during ICE changes, so it gets only a
+    // small out-of-band enrichment window.
+    if (pendingLatencyRef.current === pending) pendingLatencyRef.current = null;
+    const webrtcMetrics = await Promise.race([
+      collectWebRTCAudioStats(pcClient?.transport).catch(() => null),
+      new Promise((resolve) => window.setTimeout(() => resolve(null), 150)),
+    ]);
     const completeMetrics = {
       ...(pending.serverPayload || {}),
       measurement_source: 'client',
       ...clientMetrics,
       ...(webrtcMetrics || {}),
+      capture_reported_latency_ms:
+        sessionTelemetryRef.current?.payload.capture?.reported_latency_ms ?? null,
+      capture_sample_rate:
+        sessionTelemetryRef.current?.payload.capture?.sample_rate ?? null,
+      capture_channel_count:
+        sessionTelemetryRef.current?.payload.capture?.channel_count ?? null,
+      capture_echo_cancellation:
+        sessionTelemetryRef.current?.payload.capture?.echo_cancellation ?? null,
+      capture_noise_suppression:
+        sessionTelemetryRef.current?.payload.capture?.noise_suppression ?? null,
+      capture_auto_gain_control:
+        sessionTelemetryRef.current?.payload.capture?.auto_gain_control ?? null,
     };
     setLiveLatency((current) => (
       current?.turn_id === pending.turnId
         ? { ...current, ...completeMetrics }
         : current
     ));
-    if (pendingLatencyRef.current === pending) pendingLatencyRef.current = null;
+    setLatencySamples((samples) => (
+      addLatencySample(samples, completeMetrics)
+    ));
     // Playback has already begun. Persist metrics out-of-band so telemetry
     // cannot delay media or the next user turn.
     void fetchWithAuth('/api/telemetry/voice-latency', {
@@ -515,6 +403,14 @@ function VoiceApp({ onResetClient }) {
       console.warn('Could not persist voice latency telemetry', telemetryError);
     });
   }, [pcClient]);
+
+  const recordRemoteAudioLevel = useCallback((level) => {
+    const timing = voiceTurnTimingRef.current;
+    if (!timing.awaitingRemoteAudio || Number(level) <= 0.0001) return;
+    timing.awaitingRemoteAudio = false;
+    timing.firstRemoteAudioAt = performance.now();
+    commitClientLatency();
+  }, [commitClientLatency]);
 
   useRTVIClientEvent(
     RTVIEvent.TransportStateChanged,
@@ -533,12 +429,22 @@ function VoiceApp({ onResetClient }) {
       if (participant?.local && track.applyConstraints) {
         track.applyConstraints(buildAudioConstraints()).catch((constraintError) => {
           console.warn('Could not apply microphone DSP constraints', constraintError);
+          reportClientEvent(
+            'transport.microphone_failed',
+            'The browser could not apply the requested microphone constraints.',
+            { error_name: constraintError?.name || 'ConstraintError' },
+          );
         }).finally(() => {
           recordCaptureTrack(track, sessionTelemetryRef.current);
         });
         return;
       }
       if (!participant?.local) {
+        stopRemoteAudioMonitorRef.current?.();
+        stopRemoteAudioMonitorRef.current = monitorRemoteAudioTrack(
+          track,
+          recordRemoteAudioLevel,
+        );
         window.setTimeout(() => {
           ensureBotAudioPlayback(track).catch((playbackError) => {
             const message = playbackError?.message || playbackError;
@@ -547,10 +453,15 @@ function VoiceApp({ onResetClient }) {
                 ? `Browser blocked bot audio playback: ${message}`
                 : `Could not start bot audio playback: ${message}`,
             );
+            reportClientEvent(
+              'transport.audio_playback_failed',
+              'The browser could not start agent audio playback.',
+              { error_name: playbackError?.name || 'PlaybackError' },
+            );
           });
         }, 0);
       }
-    }, []),
+    }, [recordRemoteAudioLevel, reportClientEvent]),
   );
 
   useRTVIClientEvent(
@@ -620,20 +531,18 @@ function VoiceApp({ onResetClient }) {
     RTVIEvent.BotTtsStopped,
     useCallback(() => {
       setIsVoiceBusy(false);
-      fetchConversations();
-    }, [fetchConversations]),
+    }, []),
   );
 
   useRTVIClientEvent(
     RTVIEvent.RemoteAudioLevel,
-    useCallback((level) => {
-      const timing = voiceTurnTimingRef.current;
-      if (!timing.awaitingRemoteAudio || Number(level) <= 0.0001) return;
-      timing.awaitingRemoteAudio = false;
-      timing.firstRemoteAudioAt = performance.now();
-      commitClientLatency();
-    }, [commitClientLatency]),
+    recordRemoteAudioLevel,
   );
+
+  React.useEffect(() => () => {
+    stopRemoteAudioMonitorRef.current?.();
+    stopRemoteAudioMonitorRef.current = null;
+  }, []);
 
   useRTVIClientEvent(
     RTVIEvent.BotLlmStarted,
@@ -683,21 +592,53 @@ function VoiceApp({ onResetClient }) {
     useCallback((message) => {
       setError(message?.data?.error || message?.data?.message || 'Pipecat connection failed');
       setIsConnecting(false);
-    }, []),
+      reportClientEvent(
+        'transport.connection_lost',
+        'The realtime voice transport reported an error.',
+        { transport_state: transportState },
+      );
+    }, [reportClientEvent, transportState]),
   );
 
   useRTVIClientEvent(
     RTVIEvent.ServerMessage,
     useCallback((data) => {
       const messageData = data?.data || data;
-      if (messageData?.type === 'conversation_ready' && messageData.payload?.conversation_id) {
-        const conversationId = messageData.payload.conversation_id;
-        currentConversationIdRef.current = conversationId;
-        setCurrentConversationId(conversationId);
-        fetchConversations();
+      if (messageData?.type === 'call_ready' && messageData.payload?.call_id) {
+        const callId = messageData.payload.call_id;
+        currentCallIdRef.current = callId;
+        setCurrentCallId(callId);
+        setCurrentCallStatus(messageData.payload.status || 'active');
+        setCurrentProviders(messageData.payload.providers || null);
+        setCurrentCallStartedAt(messageData.payload.started_at || new Date().toISOString());
         return;
       }
-      if (messageData?.type === 'latency_stats' && messageData.payload) {
+      if (messageData?.type === 'call_status' && messageData.payload) {
+        setCurrentCallStatus(messageData.payload.status);
+        return;
+      }
+      if (messageData?.type === 'recording_status' && messageData.payload) {
+        setCurrentRecordingStatus(messageData.payload.status);
+        return;
+      }
+      if (messageData?.type === 'timeline_item' && messageData.payload) {
+        const item = messageData.payload;
+        if (item.component === 'tool' && item.request_id) {
+          upsertToolCall({
+            tool_call_id: item.request_id,
+            status: item.outcome === 'failed' ? 'failed' : 'error',
+          });
+          return;
+        }
+        setTranscripts((items) => capTranscriptItems([...items, {
+          id: item.fingerprint || `event-${Date.now()}`,
+          role: 'Error',
+          text: JSON.stringify(item),
+          timestamp: new Date(item.created_at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        }]));
+        return;
+      }
+      if (messageData?.type === 'turn_metrics' && messageData.payload) {
         const receivedPerfAt = performance.now();
         const timing = voiceTurnTimingRef.current;
         const payload = messageData.payload;
@@ -745,7 +686,7 @@ function VoiceApp({ onResetClient }) {
         addTranscript(
           'Aura',
           messageData.payload.text,
-          false,
+          Boolean(messageData.payload.delta),
           messageData.payload.id || null,
         );
         return;
@@ -770,15 +711,16 @@ function VoiceApp({ onResetClient }) {
           }
         ]);
       });
-    }, [addTranscript, commitClientLatency, fetchConversations, upsertToolCall]),
+    }, [addTranscript, commitClientLatency, upsertToolCall]),
   );
 
-  const startConversation = async () => {
+  const startCall = async () => {
     if (!pcClient || isConnecting || !canStart) return false;
 
     setError('');
     setIsConnecting(true);
     setLiveLatency(null);
+    setLatencySamples([]);
     const telemetry = createSessionTelemetry(START_ENDPOINT);
     sessionTelemetryRef.current = telemetry;
     stopPeerMonitorRef.current?.();
@@ -791,7 +733,6 @@ function VoiceApp({ onResetClient }) {
           transport: 'webrtc',
           body: {
             token: localStorage.getItem('aura_token'),
-            conversation_id: currentConversationId,
           },
         },
       });
@@ -810,6 +751,23 @@ function VoiceApp({ onResetClient }) {
       setError(err?.message || 'Could not connect to bot.py');
       setIsConnecting(false);
       return false;
+    }
+  };
+
+  const toggleMicrophone = async () => {
+    if (!isActive) {
+      await startCall();
+      return;
+    }
+    try {
+      await enableMic(!isMicEnabled);
+    } catch (micError) {
+      setError(micError?.message || 'Could not change microphone state');
+      reportClientEvent(
+        'transport.microphone_failed',
+        'The browser could not change the microphone state.',
+        { error_name: micError?.name || 'MicrophoneError' },
+      );
     }
   };
 
@@ -852,56 +810,81 @@ function VoiceApp({ onResetClient }) {
     }
   };
 
-  const disconnect = async () => {
+  const disconnect = useCallback(async () => {
     setError('');
     setIsConnecting(false);
     setIsVoiceBusy(false);
+    if (currentCallStartedAt) {
+      setCurrentCallElapsed(Math.max(
+        0,
+        Math.floor((Date.now() - Date.parse(currentCallStartedAt)) / 1000),
+      ));
+    }
+    setCurrentCallStatus((status) => status === 'active' ? 'ending' : status);
     stopPeerMonitorRef.current?.();
     stopPeerMonitorRef.current = null;
     try {
+      if (isActive) {
+        await Promise.resolve(
+          pcClient?.sendClientMessage('call.end', { call_id: currentCallIdRef.current }),
+        ).catch(() => undefined);
+        await Promise.resolve(pcClient?.disconnectBot()).catch(() => undefined);
+        await new Promise((resolve) => window.setTimeout(resolve, 30));
+      }
       await pcClient?.disconnect();
     } finally {
       activeBotMessageIdRef.current = null;
       botTextRef.current = '';
       onResetClient();
     }
-  };
+  }, [currentCallStartedAt, isActive, onResetClient, pcClient]);
+
+  React.useEffect(() => {
+    const handleBeforeLogout = (event) => {
+      event.detail?.respondWith?.(disconnect());
+    };
+    const handlePageHide = () => {
+      if (!isActive) return;
+      void Promise.resolve(
+        pcClient?.sendClientMessage('call.end', {
+          call_id: currentCallIdRef.current,
+        }),
+      ).catch(() => undefined);
+      void Promise.resolve(pcClient?.disconnectBot()).catch(() => undefined);
+      void Promise.resolve(pcClient?.disconnect()).catch(() => undefined);
+    };
+    window.addEventListener('aura-before-logout', handleBeforeLogout);
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('aura-before-logout', handleBeforeLogout);
+      window.removeEventListener('pagehide', handlePageHide);
+    };
+  }, [disconnect, isActive, pcClient]);
 
   return (
     <div className="app-container">
       <Sidebar
-        isMemoryPanelOpen={isMemoryPanelOpen}
-        toggleMemoryPanel={toggleMemoryPanel}
-        memories={memories}
-        deleteAllMemories={deleteAllMemories}
-        deleteMemory={deleteMemory}
-        isMemoryLoading={isMemoryLoading}
-        memoryError={memoryError}
-        sidebarTab={sidebarTab}
-        setSidebarTab={setSidebarTab}
-        startNewConversation={startNewConversation}
-        conversations={conversations}
-        currentConversationId={currentConversationId}
-        loadConversation={loadConversation}
-        deleteConversation={deleteConversation}
-        fetchFiles={fetchFiles}
-        ragFiles={ragFiles}
-        isFilesLoading={isFilesLoading}
-        isUploadingFile={isUploadingFile}
-        uploadRagFile={uploadRagFile}
-        isAddingLink={isAddingLink}
-        linkUrl={linkUrl}
-        setLinkUrl={setLinkUrl}
-        addRagLink={addRagLink}
-        fileError={fileError}
-        deleteRagFile={deleteRagFile}
-        inspectRagFile={setInspectedFile}
+        startNewCall={startNewCall}
         liveLatency={liveLatency}
+        latencySamples={latencySamples}
       />
 
-      <div className="main-stage">
+      {location.pathname === '/calls' ? <CallsPage /> : location.pathname.startsWith('/calls/') ? (
+        <CallDetailPage callId={location.pathname.split('/')[2]} />
+      ) : location.pathname === '/files' ? <FilesPage /> : location.pathname === '/memories' ? <MemoriesPage /> : (
+      <div className="main-stage page-stage">
         <div className="main-header">
-          <div className="sidebar-title" style={{ margin: 0 }}>New conversation</div>
+          <div>
+            <div className="sidebar-title" style={{ margin: 0 }}>{currentCallId ? 'Current call' : 'New call'}</div>
+            {currentCallId ? <div className="active-call-strip">
+              <span className={`status-pill ${currentCallStatus || 'initializing'}`}>{currentCallStatus || 'initializing'}</span>
+              <code>{currentCallId}</code>
+              <span className="active-call-elapsed">{Math.floor(currentCallElapsed / 60)}:{String(currentCallElapsed % 60).padStart(2, '0')}</span>
+              {currentProviders ? <span className="active-provider-chips">
+                {['stt', 'llm', 'tts'].map((kind) => <em key={kind}>{kind.toUpperCase()} {currentProviders[kind]?.model || currentProviders[kind]?.provider || '—'}</em>)}
+              </span> : null}
+            </div> : null}
+          </div>
           <div className="header-actions">
             <button
               className="theme-toggle"
@@ -957,10 +940,10 @@ function VoiceApp({ onResetClient }) {
             <button
               className={`mic-button ${isActive && isMicEnabled ? 'active' : ''} ${isActive && !isMicEnabled ? 'muted' : ''}`}
               disabled={isConnecting || (!isActive && !canStart)}
-              onClick={() => isActive ? enableMic(!isMicEnabled) : startConversation()}
-              aria-label={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start conversation'}
+              onClick={toggleMicrophone}
+              aria-label={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start call'}
               aria-pressed={isActive && isMicEnabled}
-              title={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start conversation'}
+              title={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start call'}
             >
               <Mic className="mic-icon" strokeWidth={2} />
             </button>
@@ -980,23 +963,70 @@ function VoiceApp({ onResetClient }) {
             </div>
           </div>
           {error ? <div className="error-message">{error}</div> : null}
+          {currentCallId && !isActive && !isConnecting ? <div className="post-call-actions">
+            <span>Call {currentCallStatus || 'ending'}{currentRecordingStatus ? ` · recording ${currentRecordingStatus}` : ''}</span>
+            <button className="secondary-button" onClick={() => navigate(`/calls/${currentCallId}`)}><ExternalLink size={15} /> View call details</button>
+            <button className="secondary-button" onClick={startNewCall}>Start new call</button>
+          </div> : null}
         </div>
       </div>
-      {inspectedFile ? (
-        <ChunkInspector file={inspectedFile} onClose={() => setInspectedFile(null)} />
-      ) : null}
+      )}
     </div>
   );
 }
 
 function App() {
   const [isTokenValid, setIsTokenValid] = useState(() => isValidTokenValue(localStorage.getItem('aura_token')));
-  const [client, setClient] = useState(() => createPipecatClient());
+  const [client, setClient] = useState(null);
+  const [clientError, setClientError] = useState('');
+  const iceServersRef = React.useRef(buildIceServers());
+  const logoutInProgressRef = React.useRef(false);
 
   React.useEffect(() => {
-    const handleLogout = () => {
+    if (!isTokenValid) {
+      return undefined;
+    }
+    let cancelled = false;
+    const initializeClient = async () => {
+      try {
+        const response = await fetchWithAuth('/api/transport/ice-servers');
+        const payload = await response.json();
+        if (cancelled) return;
+        iceServersRef.current = Array.isArray(payload.ice_servers)
+          ? payload.ice_servers
+          : buildIceServers();
+        setClient(createPipecatClient(iceServersRef.current));
+        setClientError('');
+      } catch (initializationError) {
+        if (!cancelled) {
+          setClientError(initializationError?.message || 'Could not initialize voice transport');
+        }
+      }
+    };
+    void initializeClient();
+    return () => { cancelled = true; };
+  }, [isTokenValid]);
+
+  React.useEffect(() => {
+    const handleLogout = async () => {
+      if (logoutInProgressRef.current) return;
+      logoutInProgressRef.current = true;
+      let teardown = Promise.resolve();
+      window.dispatchEvent(new CustomEvent('aura-before-logout', {
+        detail: {
+          respondWith(value) {
+            teardown = Promise.resolve(value);
+          },
+        },
+      }));
+      await Promise.race([
+        teardown.catch(() => undefined),
+        new Promise((resolve) => window.setTimeout(resolve, 1500)),
+      ]);
       localStorage.removeItem('aura_token');
+      setClient(null);
       setIsTokenValid(false);
+      logoutInProgressRef.current = false;
     };
     window.addEventListener('logout', handleLogout);
     return () => window.removeEventListener('logout', handleLogout);
@@ -1007,18 +1037,26 @@ function App() {
   }, []);
 
   const resetClient = useCallback(() => {
-    setClient(createPipecatClient());
+    setClient(createPipecatClient(iceServersRef.current));
   }, []);
 
   if (!isTokenValid) {
     return <Suspense fallback={null}><Auth onLogin={handleLogin} /></Suspense>;
   }
+  if (clientError) {
+    return <div className="app-container"><div className="error-message">{clientError}</div></div>;
+  }
+  if (!client) {
+    return <div className="app-container"><div className="page-loading">Preparing secure voice transport…</div></div>;
+  }
 
   return (
-    <PipecatClientProvider client={client}>
-      <Suspense fallback={<div className="app-container" />}><VoiceApp onResetClient={resetClient} /></Suspense>
-      <PipecatClientAudio />
-    </PipecatClientProvider>
+    <BrowserRouter>
+      <PipecatClientProvider client={client}>
+        <Suspense fallback={<div className="app-container" />}><VoiceApp onResetClient={resetClient} /></Suspense>
+        <PipecatClientAudio />
+      </PipecatClientProvider>
+    </BrowserRouter>
   );
 }
 

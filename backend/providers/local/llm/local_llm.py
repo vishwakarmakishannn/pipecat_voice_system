@@ -9,13 +9,20 @@ from loguru import logger
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openai.llm import OpenAILLMService
 
-from core.llm_config import first_token_timeout_seconds, total_timeout_seconds
+from core.llm_config import (
+    first_token_timeout_seconds,
+    timeout_recovery_text,
+    total_timeout_seconds,
+)
 from core.prompt_config import load_system_prompt
 from core.tool_config import tool_timeout_seconds
 from providers.llm.stream_timeout import (
-    LLMStreamDeadlineError,
     bounded_openai_stream,
+    chunk_is_recovery,
     chunk_has_meaningful_output,
+    openai_recovery_stream,
+    recovering_openai_stream,
+    report_llm_deadline,
 )
 
 from .config import LocalLLMConfig, load_local_llm_config
@@ -89,6 +96,18 @@ def _chunk_hit_length_limit(chunk) -> bool:
     )
 
 
+def _tool_schema_count(tools) -> int:
+    """Count legacy tool lists and Pipecat ``ToolsSchema`` uniformly."""
+    if isinstance(tools, (list, tuple)):
+        return len(tools)
+    standard = getattr(tools, "standard_tools", None) or []
+    custom = getattr(tools, "custom_tools", None) or {}
+    custom_count = sum(
+        len(items) for items in custom.values() if isinstance(items, (list, tuple))
+    ) if isinstance(custom, dict) else 0
+    return len(standard) + custom_count
+
+
 async def _close_stream(stream) -> None:
     close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
     if close is None:
@@ -117,6 +136,8 @@ class LocalLLMService(OpenAILLMService):
             base_url=config.base_url,
             **kwargs,
         )
+        self.diagnostic_callback = None
+        self.recovery_text_getter = None
 
     def create_client(self, **kwargs):
         """Reuse the runtime client instead of opening one pool per session."""
@@ -194,7 +215,18 @@ class LocalLLMService(OpenAILLMService):
         status = "completed"
         try:
             async for chunk in stream:
-                if not first_output_seen and chunk_has_meaningful_output(chunk):
+                recovery_output = chunk_is_recovery(chunk)
+                if recovery_output:
+                    status = "recovered"
+                    logger.warning(
+                        "voice_llm request_id={} provider=local model={} "
+                        "cold_start={} status=recovery_output latency_ms={}",
+                        request_id,
+                        model,
+                        cold_start,
+                        round((time.monotonic() - started_at) * 1000, 1),
+                    )
+                elif not first_output_seen and chunk_has_meaningful_output(chunk):
                     first_output_seen = True
                     logger.info(
                         "voice_llm request_id={} provider=local model={} "
@@ -233,24 +265,63 @@ class LocalLLMService(OpenAILLMService):
         request_id = uuid.uuid4().hex
         model = self._settings.model
         cold_start = not self._runtime.warmed
+        try:
+            grounded_recovery = (
+                self.recovery_text_getter()
+                if callable(self.recovery_text_getter)
+                else None
+            )
+        except Exception as exc:
+            grounded_recovery = None
+            logger.warning(
+                "voice_llm request_id={} provider=local "
+                "status=recovery_context_failed error_type={}",
+                request_id,
+                type(exc).__name__,
+            )
+        recovery_text = grounded_recovery or timeout_recovery_text()
+        messages = list(getattr(context, "messages", None) or [])
+        tools = getattr(context, "tools", None)
+        tool_count = _tool_schema_count(tools)
+        prompt_chars = sum(
+            len(str(message.get("content", "")))
+            if isinstance(message, dict)
+            else len(str(message))
+            for message in messages
+        )
         logger.info(
             "voice_llm request_id={} provider=local model={} cold_start={} "
-            "status=started first_output_deadline_ms={} total_deadline_ms={}",
+            "status=started first_output_deadline_ms={} total_deadline_ms={} "
+            "message_count={} prompt_chars={} tool_count={}",
             request_id,
             model,
             cold_start,
             round(first_timeout * 1000),
             round(total_timeout * 1000),
+            len(messages),
+            prompt_chars,
+            tool_count,
         )
         try:
             stream = await asyncio.wait_for(
                 super().get_chat_completions(context),
                 timeout=first_timeout,
             )
-        except TimeoutError as exc:
-            raise LLMStreamDeadlineError(
-                "Local LLM stream creation deadline exceeded"
-            ) from exc
+        except TimeoutError:
+            report_llm_deadline(
+                self.diagnostic_callback,
+                code="llm.stream_creation_timeout",
+                request_id=request_id,
+                duration_ms=round((time.monotonic() - started) * 1000, 1),
+                recovery_text=recovery_text,
+            )
+            return self._instrumented_stream(
+                openai_recovery_stream(recovery_text, model),
+                request_id=request_id,
+                model=model,
+                cold_start=cold_start,
+                started_at=started,
+            )
 
         elapsed = time.monotonic() - started
         completion_safe_stream = self._complete_truncated_response(stream, context)
@@ -259,8 +330,16 @@ class LocalLLMService(OpenAILLMService):
             max(0.001, first_timeout - elapsed),
             max(0.001, total_timeout - elapsed),
         )
-        return self._instrumented_stream(
+        recovery_stream = recovering_openai_stream(
             bounded_stream,
+            recovery_text=recovery_text,
+            model=model,
+            request_id=request_id,
+            started_at=started,
+            diagnostic_callback=self.diagnostic_callback,
+        )
+        return self._instrumented_stream(
+            recovery_stream,
             request_id=request_id,
             model=model,
             cold_start=cold_start,

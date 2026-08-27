@@ -20,6 +20,8 @@ class MoonshineConfig:
     model: str
     language: str
     update_interval_seconds: float
+    vad_window_duration_seconds: float
+    finalize_grace_seconds: float
     ttfs_p99_latency_seconds: float
     model_dir: Path | None
     cache_dir: Path | None
@@ -54,7 +56,10 @@ def _language() -> str:
 
 
 def _update_interval() -> float:
-    raw = os.getenv("MOONSHINE_UPDATE_INTERVAL_SECONDS", "0.25").strip()
+    # Moonshine only publishes implicit stream updates on this cadence. A
+    # quarter-second interval was directly visible in endpoint-to-final-STT
+    # latency, so use the provider's supported 100 ms floor for live voice.
+    raw = os.getenv("MOONSHINE_UPDATE_INTERVAL_SECONDS", "0.10").strip()
     try:
         value = float(raw)
     except ValueError as exc:
@@ -65,6 +70,52 @@ def _update_interval() -> float:
     if not 0.1 <= value <= 2.0:
         raise ValueError(
             "MOONSHINE_UPDATE_INTERVAL_SECONDS must be between 0.1 and 2.0, "
+            f"got {value}"
+        )
+    return value
+
+
+def _vad_window_duration() -> float:
+    # Moonshine defaults to a 500 ms native VAD averaging window. External
+    # Pipecat VAD has already identified speech end, so use a shorter native
+    # window to avoid holding the final transcript for another half second.
+    raw = os.getenv(
+        "MOONSHINE_VAD_WINDOW_DURATION_SECONDS",
+        "0.25",
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "MOONSHINE_VAD_WINDOW_DURATION_SECONDS must be a number, "
+            f"got {raw!r}"
+        ) from exc
+    if not 0.1 <= value <= 2.0:
+        raise ValueError(
+            "MOONSHINE_VAD_WINDOW_DURATION_SECONDS must be between 0.1 "
+            f"and 2.0, got {value}"
+        )
+    return value
+
+
+def _finalize_grace() -> float:
+    """Maximum wait for native line completion before a safety flush.
+
+    This is not an unconditional endpointing delay. Moonshine finals are
+    forwarded immediately when its native VAD completes the line; the grace
+    only bounds a stalled native stream after Pipecat has observed speech end.
+    """
+    raw = os.getenv("MOONSHINE_FINALIZE_GRACE_SECONDS", "0.35").strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "MOONSHINE_FINALIZE_GRACE_SECONDS must be a number, "
+            f"got {raw!r}"
+        ) from exc
+    if not 0.1 <= value <= 2.0:
+        raise ValueError(
+            "MOONSHINE_FINALIZE_GRACE_SECONDS must be between 0.1 and 2.0, "
             f"got {value}"
         )
     return value
@@ -108,6 +159,8 @@ def load_moonshine_config() -> MoonshineConfig:
         model=_model(),
         language=_language(),
         update_interval_seconds=_update_interval(),
+        vad_window_duration_seconds=_vad_window_duration(),
+        finalize_grace_seconds=_finalize_grace(),
         ttfs_p99_latency_seconds=_ttfs_p99_latency(),
         model_dir=_optional_directory("MOONSHINE_MODEL_DIR"),
         cache_dir=_optional_directory("MOONSHINE_VOICE_CACHE"),

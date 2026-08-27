@@ -82,6 +82,8 @@ class UserCreate(BaseModel):
     @field_validator('password')
     @classmethod
     def validate_password(cls, v):
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must be 72 UTF-8 bytes or fewer")
         if not re.search(r"[A-Z]", v):
             raise ValueError("Password must contain at least one uppercase letter")
         if not re.search(r"[a-z]", v):
@@ -89,6 +91,11 @@ class UserCreate(BaseModel):
         if not re.search(r"[0-9]", v):
             raise ValueError("Password must contain at least one digit")
         return v
+
+
+class UserLogin(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9_]+$")
+    password: str = Field(..., min_length=1, max_length=1000)
 
 class UserResponse(BaseModel):
     id: int
@@ -99,7 +106,13 @@ class Token(BaseModel):
     token_type: str
 
 def verify_password(plain_password, hashed_password):
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    encoded = plain_password.encode("utf-8")
+    if len(encoded) > 72:
+        return False
+    try:
+        return bcrypt.checkpw(encoded, hashed_password.encode("utf-8"))
+    except ValueError:
+        return False
 
 def get_password_hash(password):
     salt = bcrypt.gensalt()
@@ -158,7 +171,7 @@ async def register(
 
 @router.post("/login", response_model=Token)
 async def login(
-    user_data: UserCreate,
+    user_data: UserLogin,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):

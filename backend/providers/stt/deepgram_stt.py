@@ -304,4 +304,5 @@ def get_deepgram_stt():
     return ResilientDeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         sample_rate=audio_input_sample_rate(),
+        audio_passthrough=True,
     )

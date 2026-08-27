@@ -122,3 +122,32 @@ async def test_hydrated_session_builds_bound_llm_while_stt_and_tts_overlap(
     assert events[0] == "authenticated"
     assert "hydrated" in events
     assert events.index("hydrated") < events.index("start:llm")
+
+
+@pytest.mark.anyio
+async def test_provider_failure_retains_authenticated_call_identity(monkeypatch):
+    session = object()
+
+    async def load_session(_body):
+        return session
+
+    async def hydrate(_session):
+        return session
+
+    async def construct(name, factory):
+        if name == "llm":
+            raise RuntimeError("provider startup failed")
+        return factory()
+
+    monkeypatch.setattr(voice_services, "_construct_voice_service", construct)
+    with pytest.raises(RuntimeError) as captured:
+        await voice_services.initialize_voice_runtime(
+            lambda: "stt",
+            lambda: "tts",
+            lambda: "llm",
+            load_session,
+            {},
+            session_hydrator=hydrate,
+            session_llm_factory=lambda _session: "llm",
+        )
+    assert captured.value.voice_session is session

@@ -1,0 +1,383 @@
+{
+  "schema_version": "mswipe-site-corpus-v1",
+  "sitemap_url": "https://www.mswipe.com/sitemap.xml",
+  "generated_at": "2026-08-27T07:20:50.064550+00:00",
+  "sitemap_url_count": 30,
+  "page_count": 33,
+  "indexed_page_count": 26,
+  "duplicate_page_count": 7,
+  "chunk_count": 554,
+  "failure_count": 1,
+  "failures": [
+    {
+      "url": "https://www.mswipe.com/mswipe-career",
+      "error": "Client error '404 Not Found' for url 'https://www.mswipe.com/mswipe-career'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404",
+      "source": "https://www.mswipe.com/careers"
+    }
+  ],
+  "pages": [
+    {
+      "url": "https://www.mswipe.com/",
+      "title": "Mswipe | Smart Payment Solutions for your Businesses",
+      "page_type": "overview",
+      "authority": 1.0,
+      "quality_score": 0.9994,
+      "content_hash": "88fb747fb5647fe0dd28e88283579fccc9d72d0b295baa4c6d6f986344b5cba0",
+      "chunk_count": 34,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/about-us",
+      "title": "About Mswipe | India's Trusted Digital Payment Solutions Provider",
+      "page_type": "company",
+      "authority": 0.7,
+      "quality_score": 0.9767,
+      "content_hash": "b79521a7aa92dcd3414b4b5b3a5ed4a9092d98346f90e4174d7ebb00daca5d6f",
+      "chunk_count": 5,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/banks-enterprises",
+      "title": "Payment Solutions for Banks & Enterprises | Mswipe",
+      "page_type": "enterprise",
+      "authority": 0.9,
+      "quality_score": 0.999,
+      "content_hash": "9f4d00e6c9b52c36197d769981ea57e82356f96e0332622acbc0344ba7eb66ea",
+      "chunk_count": 23,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/blog/%20From-local-shop-to-online-store",
+      "title": "Digital Payments, Fintech & Business Insights Blog | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 1.0,
+      "content_hash": "e87f0e228b1f417a0554270d4d1dd6627efc217c46abdc3ba41e9f67bf71e93f",
+      "chunk_count": 6,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/blog/Why-a-presentable-shop-can-help-you-win-more-customers",
+      "title": "Digital Payments, Fintech & Business Insights Blog | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 1.0,
+      "content_hash": "d37200e8a88eab49090bbc92821bc834916cd254227927b27aeb3088ba19574b",
+      "chunk_count": 7,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/blog/digital-payments-can-boost-customer-retentions",
+      "title": "Digital Payments, Fintech & Business Insights Blog | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 1.0,
+      "content_hash": "5b7b0a0ade83fecfd99e4279e42c9600ee0cabf96202c5f52f3578cf09252145",
+      "chunk_count": 18,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/blog/importance-of-security-in-point-of-sale-machines",
+      "title": "Digital Payments, Fintech & Business Insights Blog | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 1.0,
+      "content_hash": "4412dbe5acb612a39a62fc90ea78b34d3083d68b4d9ea3d626400495561a3b25",
+      "chunk_count": 12,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/blog/why-banks-choose-Mswipe-as-their-trusted-payments-partner",
+      "title": "Digital Payments, Fintech & Business Insights Blog | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 1.0,
+      "content_hash": "46a8033c51df91edc8fe53aabdbafd8f3227049091fe8381499b193d4a8f4b1b",
+      "chunk_count": 8,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/blog/why-merchants-love-the-Mswipe-merchant-app",
+      "title": "Digital Payments, Fintech & Business Insights Blog | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 1.0,
+      "content_hash": "50e598fab349321aebe227864f27f5bcceb9148adf1200a0221629f7776f6303",
+      "chunk_count": 9,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/careers",
+      "title": "Careers at Mswipe | Join Our Team",
+      "page_type": "company",
+      "authority": 0.7,
+      "quality_score": 1.0,
+      "content_hash": "684e19ca1286a42290049dda7615a327c57fbca26db5336abb4d544676a5991c",
+      "chunk_count": 7,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/contact-us",
+      "title": "Contact Mswipe | Get in Touch with Our Payment Experts",
+      "page_type": "support",
+      "authority": 1.0,
+      "quality_score": 1.0,
+      "content_hash": "8d29d87d0326c4071213fe2eb25870e9575ce22805eb8ee68ef06815560af551",
+      "chunk_count": 13,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/grievance-redressal-policy",
+      "title": "Grievance Redressal Policy | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "9413956a874cc3e79eb68b6b8003eabfc5179e05851dee5ec15302b9b6a876fb",
+      "chunk_count": 7,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/grievance-redressal-policy",
+      "title": "Grievance Redressal Policy | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "9413956a874cc3e79eb68b6b8003eabfc5179e05851dee5ec15302b9b6a876fb",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/grievance-redressal-policy",
+      "last_modified": null
+    },
+    {
+      "url": "https://www.mswipe.com/in-store-solutions",
+      "title": "Smart POS Machines & Soundbox Solutions for Businesses | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 0.9909,
+      "content_hash": "2db4603225140758edde26b7dbd264b9136258b7fd30b42fb3dfc4b434844375",
+      "chunk_count": 3,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/in-store-solutions/boombox-b3",
+      "title": "Boombox B3 UPI Soundbox for Payment Alerts | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 0.9985,
+      "content_hash": "6e06227456872da179bae2eb9028e507abc338e58d7d27856dc5803eb9bb3867",
+      "chunk_count": 13,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/in-store-solutions/boombox-x1",
+      "title": "Mswipe Boombox X1 – Smart Soundbox & POS",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 0.9986,
+      "content_hash": "60af60c2568f14d14c74ae210c46f7717230a44d7b01f8971cfdb8cffa0c7a67",
+      "chunk_count": 17,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/in-store-solutions/wisepos-neo-2",
+      "title": "Wisepos Neo 2 Smart POS Machine for Businesses | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 0.9965,
+      "content_hash": "34927e23bffda828dcd54cac40c41145f4e782ecebe3d89465827468169d199e",
+      "chunk_count": 13,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/in-store-solutions/wisepos-plus",
+      "title": "Wisepos Plus Smart POS Machine for Businesses | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 0.9965,
+      "content_hash": "95aeeb3b793db6d448a110e0f92297a43e2f087aed7fd56dde0002587a1210ca",
+      "chunk_count": 15,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/knowledge",
+      "title": "Knowledge Center | Blogs, Vlogs, News & Insights | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 0.9978,
+      "content_hash": "61334ad92d87d3fe60d81c31465a532adc1bca0e4b8be706fd847b5ccbb0c29d",
+      "chunk_count": 3,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/knowledge?type=blogs",
+      "title": "Knowledge Center | Blogs, Vlogs, News & Insights | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 0.9978,
+      "content_hash": "61334ad92d87d3fe60d81c31465a532adc1bca0e4b8be706fd847b5ccbb0c29d",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/knowledge",
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/knowledge?type=mediaCoverage",
+      "title": "Knowledge Center | Blogs, Vlogs, News & Insights | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 0.9978,
+      "content_hash": "61334ad92d87d3fe60d81c31465a532adc1bca0e4b8be706fd847b5ccbb0c29d",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/knowledge",
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/knowledge?type=pressRelease",
+      "title": "Knowledge Center | Blogs, Vlogs, News & Insights | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 0.9978,
+      "content_hash": "61334ad92d87d3fe60d81c31465a532adc1bca0e4b8be706fd847b5ccbb0c29d",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/knowledge",
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/knowledge?type=vlogs",
+      "title": "Knowledge Center | Blogs, Vlogs, News & Insights | Mswipe",
+      "page_type": "editorial",
+      "authority": 0.55,
+      "quality_score": 0.9978,
+      "content_hash": "61334ad92d87d3fe60d81c31465a532adc1bca0e4b8be706fd847b5ccbb0c29d",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/knowledge",
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/merchantagreement",
+      "title": "Merchant Agreement | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "fab97e488ba1587aca291970a56af07605ba166cb15491c05cad1d57f1837f9e",
+      "chunk_count": 135,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/merchantagreement",
+      "title": "Merchant Agreement | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "fab97e488ba1587aca291970a56af07605ba166cb15491c05cad1d57f1837f9e",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/merchantagreement",
+      "last_modified": null
+    },
+    {
+      "url": "https://www.mswipe.com/online-solutions",
+      "title": "Online Payment Solutions for Businesses | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 0.9977,
+      "content_hash": "ce2b80b9141acd151ea5e3e6953df6453bb6c2f29281193f4e0dbd41b4d669ce",
+      "chunk_count": 13,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/online-solutions/pay-by-link",
+      "title": "Pay by Link | Send Payment Links & Get Paid Online | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 1.0,
+      "content_hash": "fdd1674cbfe585ebf60290312f07dd8498599f76c6776037a3578ebef08223f4",
+      "chunk_count": 21,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/online-solutions/payment-gateway",
+      "title": "Payment Gateway for Businesses | Secure Online Payments | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 1.0,
+      "content_hash": "f9c3eeb0b051f97571ea43d6dddbb0e2dab7d8878ecce9584bcc6febe980df5a",
+      "chunk_count": 15,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/privacy-policy",
+      "title": "Privacy Policy | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "b15a504066514de476fe376a24f56c716b7e6fe8ae8989012121549806fc5e9f",
+      "chunk_count": 13,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/privacy-policy",
+      "title": "Privacy Policy | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "b15a504066514de476fe376a24f56c716b7e6fe8ae8989012121549806fc5e9f",
+      "chunk_count": 0,
+      "duplicate_of": "https://www.mswipe.com/privacy-policy",
+      "last_modified": null
+    },
+    {
+      "url": "https://www.mswipe.com/support",
+      "title": "Mswipe Support | Merchant Help & Customer Assistance",
+      "page_type": "support",
+      "authority": 1.0,
+      "quality_score": 1.0,
+      "content_hash": "3dcc9900a9608f112f01d715b4bbffc10c99eb6e0e2a17fd7896d73d7d6ff78f",
+      "chunk_count": 3,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/terms-and-conditions",
+      "title": "Terms & Conditions | Mswipe",
+      "page_type": "legal",
+      "authority": 0.45,
+      "quality_score": 1.0,
+      "content_hash": "ff7ffb5f0331d8942726e573c2719194540746ae613034b447accdb5134b48a8",
+      "chunk_count": 135,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    },
+    {
+      "url": "https://www.mswipe.com/tracking-solutions/app-and-portal",
+      "title": "Merchant App & Portal for Business Tracking | Mswipe",
+      "page_type": "product",
+      "authority": 0.95,
+      "quality_score": 1.0,
+      "content_hash": "4b525614f06ca6ad1cce5958a1d9cb5120061c85e1bb9e715d4db1a4c907422f",
+      "chunk_count": 6,
+      "duplicate_of": null,
+      "last_modified": "2026-06-11"
+    }
+  ]
+}

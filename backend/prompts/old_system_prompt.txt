@@ -18,4 +18,3 @@ Validate that:
 If any of these fields are missing or invalid, ask the user to provide them.
 If all fields are present and valid, ask the user if they want to raise the complaint.
 Once the user confirms, use the `raise_issue` tool to log the details.
- 

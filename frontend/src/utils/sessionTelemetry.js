@@ -171,6 +171,41 @@ export async function collectWebRTCAudioStats(transport) {
   };
 }
 
+export function monitorRemoteAudioTrack(track, onLevel, intervalMs = 16) {
+  if (!track || track.kind !== 'audio') return () => {};
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass || typeof MediaStream === 'undefined') return () => {};
+
+  const context = new AudioContextClass({ latencyHint: 'interactive' });
+  const source = context.createMediaStreamSource(new MediaStream([track]));
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0;
+  source.connect(analyser);
+  const samples = new Float32Array(analyser.fftSize);
+  let stopped = false;
+  const timer = window.setInterval(() => {
+    if (stopped || track.readyState === 'ended') return;
+    analyser.getFloatTimeDomainData(samples);
+    let energy = 0;
+    for (const sample of samples) energy += sample * sample;
+    onLevel(Math.sqrt(energy / samples.length));
+  }, intervalMs);
+
+  void context.resume?.().catch(() => undefined);
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    window.clearInterval(timer);
+    track.removeEventListener?.('ended', stop);
+    source.disconnect?.();
+    analyser.disconnect?.();
+    void context.close?.().catch(() => undefined);
+  };
+  track.addEventListener?.('ended', stop, { once: true });
+  return stop;
+}
+
 export async function withConnectionDeadline(connectPromise, timeoutMs, onTimeout) {
   let timer;
   try {

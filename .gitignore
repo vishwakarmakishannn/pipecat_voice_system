@@ -36,6 +36,9 @@ dist/
 
 # Uploads
 uploads/
+backend/recording-spool/
+backend/recordings/
+backend/data/persistence-spool/
 backend/whisper_models/
 models/
 llama.cpp/
@@ -56,3 +59,12 @@ groq_test.py
 stt_test.py
 question.txt
 llm_test.py
+issue.md
+VOICE_SYSTEM_2.0.md
+
+mswipe-email-agent/
+
+local_llm_start_command.txt
+RAG_LATENCY_ARCHITECTURE_PLAN
+rag_plan.md
+stt_test.py

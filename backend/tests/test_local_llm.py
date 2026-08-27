@@ -7,7 +7,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 from providers.local.llm.config import LocalLLMConfig, load_local_llm_config
-from providers.local.llm.local_llm import LocalLLMService
+from providers.local.llm.local_llm import LocalLLMService, _tool_schema_count
 from providers.local.llm import local_llm as local_llm_module
 from providers.local.llm.runtime import LocalLLMRuntime
 
@@ -62,6 +62,17 @@ class FakeClient:
 
     async def close(self):
         self.closed = True
+
+
+def test_tool_schema_count_supports_pipecat_schema_and_legacy_lists():
+    schema = SimpleNamespace(
+        standard_tools=[object(), object()],
+        custom_tools={"openai": [{"type": "web_search"}]},
+    )
+
+    assert _tool_schema_count(schema) == 3
+    assert _tool_schema_count([object(), object()]) == 2
+    assert _tool_schema_count(None) == 0
 
 
 def test_local_config_defaults_match_tested_qwen_profile(monkeypatch):
@@ -127,10 +138,19 @@ async def test_runtime_warms_once_under_concurrent_calls_and_closes():
     assert len(client.completions.calls) == 2
     assert client.completions.calls[0]["extra_body"]["reasoning_effort"] == "none"
     assert client.completions.calls[0]["extra_body"]["cache_prompt"] is True
+    assert sorted(
+        call["extra_body"]["id_slot"]
+        for call in client.completions.calls
+    ) == [0, 1]
     assert [
         tool["function"]["name"]
         for tool in client.completions.calls[0]["tools"]
-    ] == ["get_current_datetime", "tavily_search"]
+    ] == [
+        "get_current_datetime",
+        "search_uploaded_content",
+        "tavily_search",
+        "manage_issue_draft",
+    ]
     assert client.completions.calls[0]["tool_choice"] == "auto"
 
     await runtime.close()

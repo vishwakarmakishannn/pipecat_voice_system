@@ -21,9 +21,12 @@ Run the bot using::
 """
 
 import asyncio
+from dataclasses import asdict
+import hashlib
 import json
 import os
 import time
+import uuid
 
 from dotenv import load_dotenv
 
@@ -44,6 +47,7 @@ from loguru import logger
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.frames.frames import (
+    ErrorFrame,
     Frame,
     LLMFullResponseEndFrame,
     LLMTextFrame,
@@ -81,15 +85,36 @@ from providers.tts.factory import (
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
-from pipecat.turns.user_turn_strategies import UserTurnStrategies, TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_stop import (
+    SpeechTimeoutUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from services.memory import (
     build_live_context_messages,
     build_session_memory_context,
     build_turn_memory_context,
     hydrate_memory_bundle,
     load_session_bundle,
-    save_conversation_message,
-    save_conversation_summary,
+)
+from services.calls import (
+    CallEventRecorder,
+    fail_nonterminal_runner_call,
+    finalize_call,
+    mark_call_ending,
+    mark_call_active,
+    save_call_event,
+    save_call_summary,
+    save_transcript_entry,
+    snapshot_call_configuration,
+    touch_active_call,
+    utcnow,
+)
+from services.recordings import (
+    CallAudioBufferProcessor,
+    CallRecordingWriter,
+    mark_recording_failed,
+    recover_unfinished_recordings,
 )
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
 from services.rag import (
@@ -101,7 +126,9 @@ from services.rag import (
 from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from core.voice_config import load_endpointing_config, startup_greeting
 from core.voice_services import initialize_voice_runtime
+from core.llm_config import timeout_recovery_text
 from core.prompt_config import load_system_prompt
+from core.tool_schema import tool_schema_hash
 from core.context_summary import (
     build_assistant_summary_params,
     ContextMutationEpoch,
@@ -110,6 +137,7 @@ from core.context_summary import (
 from core.context_summary_config import load_voice_context_summary_config
 from providers.llm.context_summary import build_context_summary_service
 from core.audio_config import audio_input_sample_rate, audio_out_10ms_chunks, audio_output_sample_rate
+from core.recording_config import RECORDING_SAMPLE_RATE
 from core.turn_analyzer import (
     SharedModelSileroVADAnalyzer,
     SharedModelSmartTurnAnalyzerV3,
@@ -120,25 +148,48 @@ from core.admission import current_voice_slot_id, voice_admission
 from core.latency_observer import PipelineLatencyObserver, event_loop_lag_monitor
 from core.realtime_gate import realtime_turn_gate
 from tools.tavily import tavily_search
-from tools.raise_issue import raise_issue
+from tools.raise_issue import IssueWorkflowState, manage_issue_draft
 from tools.datetime_tool import get_current_datetime
+from tools.rag import search_uploaded_content
 
 from core.processors import (
-    ConversationMemoryProcessor,
+    CallTimelineProcessor,
     ToolFillerProcessor,
     ContextRetrievalProcessor,
     LeadingSilenceTrimmerProcessor,
     TurnContextCleanupProcessor,
     TurnLatencyState,
     LatencyBoundaryProcessor,
+    CallUsageMetricsProcessor,
     BoundedContextProcessor,
+    AssistantOutputGuardProcessor,
     immutable_context_messages,
     ToolRoutingProcessor,
     transport_server_message,
 )
+from core.task_queue import task_queue
 
 
-async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+async def _cancel_explicit_call(worker: PipelineWorker) -> None:
+    """Cancel immediately when the caller intentionally ends the call."""
+    await worker.cancel(reason="user_ended")
+
+
+def _acknowledge_client_ready(
+    call_activated: bool,
+    startup_sent: bool,
+    activated_now: bool,
+) -> tuple[bool, bool, bool]:
+    """Return monotonic activation state and whether startup runs this time."""
+    first_ready = not startup_sent
+    return call_activated or activated_now, True, first_ready
+
+
+async def _run_bot(
+    transport: BaseTransport,
+    runner_args: RunnerArguments,
+    runner_session_id: str,
+) -> None:
     """Run the voice bot for this session.
 
     Args:
@@ -151,22 +202,51 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     logger.info("Starting bot")
 
     summary_config = load_voice_context_summary_config()
+    session_instruction = None
 
     def build_session_llm(bundle):
+        nonlocal session_instruction
+        session_instruction = load_system_prompt(
+            session_memory_context=build_session_memory_context(bundle)
+        )
         return get_llm(
-            system_instruction=load_system_prompt(
-                session_memory_context=build_session_memory_context(bundle)
-            )
+            system_instruction=session_instruction
         )
 
     # Constructors may load ONNX/Piper models or initialize provider clients.
     # They are independent, so keep them off the event loop and overlap them.
-    (stt, tts, llm), memory_bundle = await initialize_voice_runtime(
-        get_stt, get_tts, get_llm,
-        load_session_bundle, runner_args.body,
-        session_hydrator=hydrate_memory_bundle,
-        session_llm_factory=build_session_llm,
-    )
+    session_body = dict(runner_args.body) if isinstance(runner_args.body, dict) else {}
+    session_body["_runner_session_id"] = runner_session_id
+    transport_name = transport.__class__.__name__.lower()
+    session_body["_transport"] = "daily" if "daily" in transport_name else "webrtc"
+    try:
+        (stt, tts, llm), memory_bundle = await initialize_voice_runtime(
+            get_stt, get_tts, get_llm,
+            load_session_bundle, session_body,
+            session_hydrator=hydrate_memory_bundle,
+            session_llm_factory=build_session_llm,
+        )
+    except BaseException as exc:
+        failed_bundle = getattr(exc, "voice_session", None)
+        failed_call_id = failed_bundle.call.id if failed_bundle else None
+        if failed_call_id:
+            await save_call_event(
+                failed_call_id,
+                component="pipeline",
+                code="pipeline.startup_failed",
+                severity="critical",
+                outcome="failed",
+                safe_message="The call could not start because a voice service failed to initialize.",
+                operator_detail=exc,
+                fatal=True,
+            )
+            await finalize_call(
+                failed_call_id,
+                status="failed",
+                end_reason="provider_startup_failed",
+                ended_by="system",
+            )
+        raise
     # Warm OpenAI-compatible provider networking while the rest of the
     # session pipeline is assembled. This uses the same client instance that
     # will serve the first turn and fails open inside the provider.
@@ -180,19 +260,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     if memory_bundle:
         logger.info(
             f"Loaded memory for user={memory_bundle.user.id} "
-            f"conversation={memory_bundle.conversation.id} "
-            f"facts={len(memory_bundle.facts)} recent_messages={len(memory_bundle.recent_messages)}"
+            f"call={memory_bundle.call.id} facts={len(memory_bundle.facts)}"
         )
-    conversation_id = memory_bundle.conversation.id if memory_bundle else None
+    call_id = memory_bundle.call.id if memory_bundle else None
     user_id = memory_bundle.user.id if memory_bundle else None
     if memory_bundle:
         prime_rag_corpus_status(user_id, memory_bundle.has_ready_rag_corpus)
-    assistant_memory = ConversationMemoryProcessor(
-        conversation_id,
-        capture="assistant",
-        name="AssistantMemory",
-    )
-
     context = LLMContext(
         messages=memory_messages,
         tools=[]
@@ -220,6 +293,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     )
     latency_state = TurnLatencyState(
         session_id=getattr(runner_args, "session_id", None),
+        call_id=call_id,
         user_id=user_id,
         stt_provider=os.getenv("STT_PROVIDER", "deepgram").strip().lower(),
         stt_model=getattr(getattr(stt, "_settings", None), "model", None),
@@ -233,19 +307,24 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     )
     context_retrieval = ContextRetrievalProcessor(
         user_id,
-        conversation_id,
+        call_id,
         context,
         latency_state,
         ready_corpus_check=user_has_ready_rag_corpus,
         mutation_epoch=mutation_epoch,
         name="ContextRetrieval",
     )
+    if hasattr(llm, "recovery_text_getter"):
+        llm.recovery_text_getter = context_retrieval.timeout_recovery_text
+    issue_workflow = IssueWorkflowState()
     tool_router = ToolRoutingProcessor(
         context,
         search_tool=tavily_search,
-        issue_tool=raise_issue,
+        issue_tool=manage_issue_draft,
         datetime_tool=get_current_datetime,
-        latency_state=latency_state,
+        document_tool=search_uploaded_content,
+        document_tool_available=context_retrieval.document_tool_available,
+        issue_workflow=issue_workflow,
         name="ToolRouter",
     )
     context_cleanup = TurnContextCleanupProcessor(
@@ -254,15 +333,24 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     endpointing = load_endpointing_config()
     logger.info(
         "voice_endpointing vad_confidence={} vad_start_secs={} vad_stop_secs={} "
-        "vad_min_volume={} smart_turn_stop_secs={}",
+        "vad_min_volume={} turn_stop_strategy={} smart_turn_stop_secs={} "
+        "speech_timeout_secs={}",
         endpointing.vad_confidence,
         endpointing.vad_start_secs,
         endpointing.vad_stop_secs,
         endpointing.vad_min_volume,
+        endpointing.turn_stop_strategy,
         endpointing.smart_turn_stop_secs,
+        endpointing.speech_timeout_secs,
     )
-    user_turn_strategies = UserTurnStrategies(
-        stop=[
+    if endpointing.turn_stop_strategy == "speech_timeout":
+        stop_strategies = [
+            SpeechTimeoutUserTurnStopStrategy(
+                user_speech_timeout=endpointing.speech_timeout_secs,
+            )
+        ]
+    else:
+        stop_strategies = [
             TurnAnalyzerUserTurnStopStrategy(
                 turn_analyzer=SharedModelSmartTurnAnalyzerV3(
                     params=SmartTurnParams(
@@ -273,18 +361,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                 )
             )
         ]
+    user_turn_strategies = UserTurnStrategies(stop=stop_strategies)
+    vad_analyzer = SharedModelSileroVADAnalyzer(
+        params=VADParams(
+            confidence=endpointing.vad_confidence,
+            start_secs=endpointing.vad_start_secs,
+            stop_secs=endpointing.vad_stop_secs,
+            min_volume=endpointing.vad_min_volume,
+        )
     )
+    latency_state.vad_diagnostics_getter = vad_analyzer.diagnostics
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SharedModelSileroVADAnalyzer(
-                params=VADParams(
-                    confidence=endpointing.vad_confidence,
-                    start_secs=endpointing.vad_start_secs,
-                    stop_secs=endpointing.vad_stop_secs,
-                    min_volume=endpointing.vad_min_volume,
-                )
-            ),
+            vad_analyzer=vad_analyzer,
             user_turn_strategies=user_turn_strategies,
         ),
         assistant_params=build_assistant_summary_params(
@@ -293,7 +383,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     )
 
     @assistant_aggregator.event_handler("on_summary_applied")
-    async def persist_applied_context_summary(aggregator, event):
+    async def persist_applied_context_summary(aggregator, summarizer, event):
+        del aggregator, summarizer
         summary = extract_live_conversation_summary(context.messages)
         logger.info(
             "voice_context_summary status=applied original_messages={} "
@@ -302,18 +393,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             event.new_message_count,
             event.summarized_message_count,
         )
-        if summary and conversation_id:
+        if summary and call_id:
             from core.task_queue import task_queue
 
             task_queue.enqueue(
-                save_conversation_summary,
-                conversation_id,
+                save_call_summary,
+                call_id,
                 summary,
-                key=conversation_id,
+                key=str(call_id),
             )
 
     @user_aggregator.event_handler("on_user_turn_started")
     async def reset_query_scoped_turn_state(aggregator, strategy):
+        latency_state.user_audio_offset_ms = audio_buffer.elapsed_ms
         context_retrieval.start_user_turn()
 
     @user_aggregator.event_handler("on_user_turn_stopped")
@@ -322,14 +414,48 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         if content:
             from core.task_queue import task_queue
             task_queue.enqueue(
-                save_conversation_message,
-                conversation_id,
+                save_transcript_entry,
+                call_id,
                 "You",
                 content,
-                key=conversation_id,
+                source="typed_user" if latency_state.input_mode == "text" else "stt_final",
+                turn_id=latency_state.turn_id,
+                audio_offset_ms=latency_state.user_audio_offset_ms,
+                key=str(call_id),
             )
 
-    tool_filler = ToolFillerProcessor(latency_state, name="ToolFiller")
+    recording_writer = CallRecordingWriter(call_id, user_id) if call_id and user_id else None
+    audio_buffer = CallAudioBufferProcessor(
+        sample_rate=RECORDING_SAMPLE_RATE,
+        num_channels=1,
+        buffer_size=RECORDING_SAMPLE_RATE * 2,
+        auto_start_recording=True,
+        name="CallAudioBuffer",
+    )
+
+    @audio_buffer.event_handler("on_audio_data")
+    async def on_recording_audio(processor, audio, sample_rate, channels):
+        if recording_writer:
+            await recording_writer.accept_audio(audio, sample_rate, channels)
+
+    audio_offset_getter = lambda: audio_buffer.elapsed_ms
+    latency_state.audio_offset_getter = audio_offset_getter
+    context_retrieval._audio_offset_getter = audio_offset_getter
+    assistant_memory = CallTimelineProcessor(
+        call_id,
+        capture="assistant",
+        latency_state=latency_state,
+        spoken_recovery_text=timeout_recovery_text(),
+        audio_offset_getter=lambda: latency_state.assistant_audio_offset_ms,
+        name="AssistantMemory",
+    )
+    assistant_output_guard = AssistantOutputGuardProcessor(name="AssistantOutputGuard")
+    tool_filler = ToolFillerProcessor(
+        latency_state,
+        call_id=call_id,
+        audio_offset_getter=audio_offset_getter,
+        name="ToolFiller",
+    )
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
@@ -346,7 +472,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             context_retrieval,
             tool_router,
             context_window,
+            LatencyBoundaryProcessor(
+                latency_state, "llm_request", name="PreLLMLatency"
+            ),
             llm,
+            assistant_output_guard,
             LatencyBoundaryProcessor(latency_state, "llm", name="PostLLMLatency"),
             context_cleanup,
             tool_filler,
@@ -355,6 +485,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             LeadingSilenceTrimmerProcessor(name="LeadingSilenceTrimmer"),
             LatencyBoundaryProcessor(latency_state, "tts", name="PostTTSLatency"),
             transport.output(),
+            audio_buffer,
+            CallUsageMetricsProcessor(latency_state, name="CallUsageMetrics"),
             assistant_aggregator,
         ]
     )
@@ -366,30 +498,230 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             enable_usage_metrics=True,
         ),
         rtvi_observer_params=RTVIObserverParams(
+            # Only sanitized deltas emitted after AssistantOutputGuard are sent
+            # to the dashboard. Raw provider LLM frames must never bypass it.
+            bot_llm_enabled=False,
             # Tool lifecycle UI events are emitted explicitly so filler always
             # appears first and provider-specific frame direction cannot hide them.
             function_call_report_level={"*": RTVIFunctionCallReportLevel.DISABLED}
         ),
-        app_resources={"latency_state": latency_state},
+        conversation_id=str(call_id) if call_id else None,
+        app_resources={
+            "latency_state": latency_state,
+            "call_id": call_id,
+            "issue_workflow": issue_workflow,
+            "context_retrieval": context_retrieval,
+        },
         observers=[PipelineLatencyObserver()],
     )
+
+    async def send_live_event(payload):
+        await worker.queue_frames([transport_server_message("timeline_item", payload, urgent=True)])
+
+    diagnostic_recorder = CallEventRecorder(
+        call_id,
+        provider_context={
+            "stt": (latency_state.stt_provider, latency_state.stt_model),
+            "llm": (latency_state.llm_provider, latency_state.llm_model),
+            "tts": (latency_state.tts_provider, latency_state.tts_model),
+        },
+        live_sender=send_live_event,
+        turn_id_getter=lambda: latency_state.turn_id or None,
+    )
+    tool_filler._diagnostic_recorder = diagnostic_recorder
+    assistant_output_guard._diagnostic_recorder = diagnostic_recorder
+    task_queue.register_rejection_handler(
+        str(call_id), diagnostic_recorder.record_queue_rejection
+    )
+    if hasattr(llm, "diagnostic_callback"):
+        def record_llm_diagnostic(**payload):
+            if payload.get("recovered"):
+                latency_state.response_outcome = "recovered"
+                latency_state.mark_stage("llm_recovered")
+            diagnostic_recorder.record(**payload)
+
+        llm.diagnostic_callback = record_llm_diagnostic
+    if hasattr(llm, "phase_callback"):
+        def record_llm_phase(*, phase, attempt=None, **_details):
+            suffix = f"_{attempt}" if attempt is not None else ""
+            latency_state.mark_stage(f"llm_{phase}{suffix}")
+
+        llm.phase_callback = record_llm_phase
+    context_retrieval._diagnostic_recorder = diagnostic_recorder
+    if context_summary_llm and hasattr(context_summary_llm, "diagnostic_callback"):
+        context_summary_llm.diagnostic_callback = diagnostic_recorder.record
+
+    endpointing_snapshot = asdict(endpointing)
+    settings_by_service = {
+        "stt": getattr(stt, "_settings", None),
+        "llm": getattr(llm, "_settings", None),
+        "tts": getattr(tts, "_settings", None),
+    }
+    if call_id:
+        await snapshot_call_configuration(
+            call_id,
+            transport=session_body["_transport"],
+            stt_provider=latency_state.stt_provider,
+            stt_model=latency_state.stt_model,
+            stt_language=getattr(settings_by_service["stt"], "language", None),
+            llm_provider=latency_state.llm_provider,
+            llm_model=latency_state.llm_model,
+            tts_provider=latency_state.tts_provider,
+            tts_model=latency_state.tts_model,
+            tts_voice=getattr(settings_by_service["tts"], "voice", None),
+            tts_language=getattr(settings_by_service["tts"], "language", None),
+            input_sample_rate=audio_input_sample_rate(),
+            output_sample_rate=audio_output_sample_rate(),
+            recording_sample_rate=RECORDING_SAMPLE_RATE,
+            provider_config={
+                name: {
+                    key: value
+                    for key in ("model", "language", "voice")
+                    if (value := getattr(settings, key, None)) is not None
+                }
+                for name, settings in settings_by_service.items()
+            },
+            endpointing_config=endpointing_snapshot,
+            pipeline_config={
+                "context_summary_enabled": summary_config.enabled,
+                "context_max_messages": context_max_messages,
+                "context_max_chars": context_max_chars,
+            },
+            prompt_version=os.getenv("VOICE_PROMPT_VERSION", "voice-2.0"),
+            prompt_hash=hashlib.sha256((session_instruction or "").encode()).hexdigest(),
+            tool_schema_hash=tool_schema_hash(
+                tavily_search,
+                search_uploaded_content,
+                manage_issue_draft,
+                get_current_datetime,
+            ),
+            rag_config_version=os.getenv("RAG_CONFIG_VERSION", "voice-2.0"),
+            application_version=os.getenv("APP_VERSION") or os.getenv("GIT_SHA") or "development",
+        )
+
+    if recording_writer:
+        try:
+            await recording_writer.start()
+        except Exception as exc:
+            logger.exception("recording_start status=failed call_id={}", call_id)
+            await mark_recording_failed(
+                call_id,
+                "recording.spool_failed",
+                "Call recording could not be started.",
+            )
+            await save_call_event(
+                call_id,
+                component="recording",
+                code="recording.spool_failed",
+                severity="error",
+                outcome="degraded",
+                safe_message="Call recording could not be started; the call will continue.",
+                operator_detail=exc,
+            )
+            recording_writer = None
+
+    final_status = "completed"
+    final_reason = "runner_finished"
+    final_ended_by = "system"
+    call_activated = False
+    startup_sent = False
+    call_heartbeat_task = None
+    disconnect_grace_task = None
+    disconnect_grace_expired = False
+    user_end_requested = False
+
+    async def heartbeat_call():
+        try:
+            while True:
+                await asyncio.sleep(10)
+                if not await touch_active_call(call_id):
+                    return
+        except asyncio.CancelledError:
+            return
+
+    @worker.event_handler("on_pipeline_error")
+    async def on_pipeline_error(worker, frame):
+        nonlocal final_status, final_reason, final_ended_by
+        processor_name = str(getattr(frame, "processor", "") or "pipeline").lower()
+        component = next(
+            (name for name in ("stt", "llm", "tts", "rag", "tool", "transport") if name in processor_name),
+            "pipeline",
+        )
+        code = f"{component}.inference_failed" if component in {"stt", "tts"} else "pipeline.fatal" if frame.fatal else f"{component}.execution_failed"
+        diagnostic_recorder.record(
+            component=component,
+            code=code,
+            severity="critical" if frame.fatal else "error",
+            outcome="failed" if frame.fatal else "degraded",
+            safe_message=f"The {component} component reported a voice pipeline failure.",
+            operator_detail=getattr(frame, "exception", None),
+            fatal=bool(frame.fatal),
+        )
+        if frame.fatal:
+            final_status = "failed"
+            final_reason = "pipeline_fatal"
+            final_ended_by = "system"
 
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         # A greeting does not require model reasoning. Keeping it out of the
         # LLM path removes startup TTFT and avoids a permanent prompt message.
         startup_frames = []
-        if conversation_id:
+        first_ready = False
+        nonlocal call_activated, call_heartbeat_task, startup_sent
+        if call_id:
+            activated_now = await mark_call_active(call_id)
+            call_activated, startup_sent, first_ready = _acknowledge_client_ready(
+                call_activated, startup_sent, activated_now
+            )
+            if call_activated and not call_heartbeat_task:
+                call_heartbeat_task = asyncio.create_task(
+                    heartbeat_call(), name=f"call-heartbeat-{call_id}"
+                )
             startup_frames.append(OutputTransportMessageFrame({
                 "label": "rtvi-ai",
                 "type": "server-message",
                 "data": {
-                    "type": "conversation_ready",
-                    "payload": {"conversation_id": conversation_id},
+                    "type": "call_ready",
+                    "payload": {
+                        "call_id": str(call_id),
+                        "status": "active",
+                        "started_at": memory_bundle.call.started_at.isoformat(),
+                        "providers": {
+                            "stt": {"provider": latency_state.stt_provider, "model": latency_state.stt_model},
+                            "llm": {"provider": latency_state.llm_provider, "model": latency_state.llm_model},
+                            "tts": {"provider": latency_state.tts_provider, "model": latency_state.tts_model},
+                        },
+                    },
                 },
             }))
+            startup_frames.append(transport_server_message(
+                "call_status",
+                {"call_id": str(call_id), "status": "active"},
+                urgent=True,
+            ))
+            startup_frames.append(transport_server_message(
+                "recording_status",
+                {
+                    "call_id": str(call_id),
+                    "status": "recording" if recording_writer else "failed",
+                },
+                urgent=True,
+            ))
         greeting = startup_greeting()
-        if greeting:
+        if greeting and first_ready:
+            # Duplicate ready messages and transport reconnects acknowledge the
+            # active call above, but one-time durable/user-visible startup work
+            # must never be replayed.
+            if call_id:
+                task_queue.enqueue(
+                    save_transcript_entry,
+                    call_id,
+                    "Aura",
+                    greeting,
+                    source="greeting",
+                    key=str(call_id),
+                )
             startup_frames.append(transport_server_message(
                 "assistant_transcript",
                 {
@@ -402,14 +734,51 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         if startup_frames:
             await worker.queue_frames(startup_frames)
 
+    @worker.rtvi.event_handler("on_client_message")
+    async def on_client_message(rtvi, message):
+        nonlocal final_reason, final_ended_by, user_end_requested
+        if getattr(message, "type", None) == "call.end":
+            user_end_requested = True
+            final_reason = "user_ended"
+            final_ended_by = "client"
+            # An explicit hang-up is not a recoverable transport interruption.
+            # Stop the pipeline now so teardown can persist the terminal call
+            # state; the reconnect grace below is reserved for accidental loss.
+            await _cancel_explicit_call(worker)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
+        nonlocal disconnect_grace_task
         logger.info("Client connected")
+        if disconnect_grace_task and not disconnect_grace_task.done():
+            disconnect_grace_task.cancel()
+        disconnect_grace_task = None
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info("Client disconnected")
-        await worker.cancel()
+        nonlocal disconnect_grace_task
+        if user_end_requested:
+            logger.info("Client disconnected after explicit call end; skipping reconnect grace")
+            await _cancel_explicit_call(worker)
+            return
+        logger.info("Client disconnected; allowing 30-second active-call reconnect grace")
+        if disconnect_grace_task and not disconnect_grace_task.done():
+            return
+
+        async def expire_disconnect_grace():
+            nonlocal final_reason, final_ended_by, disconnect_grace_expired
+            try:
+                await asyncio.sleep(30)
+                disconnect_grace_expired = True
+                final_reason = "client_disconnect"
+                final_ended_by = "client"
+                await worker.cancel()
+            except asyncio.CancelledError:
+                return
+
+        disconnect_grace_task = asyncio.create_task(
+            expire_disconnect_grace(), name=f"call-reconnect-grace-{call_id}"
+        )
 
     runner = WorkerRunner(handle_sigint=False)
 
@@ -421,16 +790,161 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             )
         await runner.add_workers(worker)
         await runner.run()
+    except asyncio.CancelledError:
+        if disconnect_grace_expired or user_end_requested:
+            final_status = "completed"
+        else:
+            final_status = "cancelled"
+            final_reason = "worker_cancelled"
+            final_ended_by = "system"
+        raise
+    except Exception as exc:
+        final_status = "failed"
+        final_reason = "runner_exception"
+        final_ended_by = "system"
+        diagnostic_recorder.record(
+            component="pipeline",
+            code="pipeline.fatal",
+            severity="critical",
+            outcome="failed",
+            safe_message="The voice pipeline stopped unexpectedly.",
+            operator_detail=exc,
+            fatal=True,
+        )
+        raise
     finally:
         realtime_turn_gate.end(latency_state.priority_key)
-        if llm_warmup_task and not llm_warmup_task.done():
-            llm_warmup_task.cancel()
-        await asyncio.gather(
-            *(tuple([llm_warmup_task]) if llm_warmup_task else ()),
-            return_exceptions=True,
-        )
-        if context_summary_llm:
-            await context_summary_llm.close()
+        call_ended_at = utcnow()
+        try:
+            for background in (disconnect_grace_task, llm_warmup_task):
+                if background and not background.done():
+                    background.cancel()
+            await asyncio.gather(
+                *(
+                    task
+                    for task in (disconnect_grace_task, llm_warmup_task)
+                    if task
+                ),
+                return_exceptions=True,
+            )
+
+            if context_summary_llm:
+                try:
+                    await context_summary_llm.close()
+                except Exception as exc:
+                    logger.exception(
+                        "call_teardown status=context_summary_close_failed call_id={}",
+                        call_id,
+                    )
+                    diagnostic_recorder.record(
+                        component="context",
+                        code="context.summary_shutdown_failed",
+                        severity="warning",
+                        outcome="degraded",
+                        safe_message="The context-summary service did not close cleanly.",
+                        operator_detail=exc,
+                    )
+
+            if call_id:
+                try:
+                    await mark_call_ending(call_id)
+                except Exception as exc:
+                    logger.exception(
+                        "call_teardown status=mark_ending_failed call_id={}", call_id
+                    )
+                    diagnostic_recorder.record(
+                        component="persistence",
+                        code="persistence.call_ending_failed",
+                        severity="error",
+                        outcome="degraded",
+                        safe_message="The call lifecycle could not enter its ending state cleanly.",
+                        operator_detail=exc,
+                    )
+
+            try:
+                await audio_buffer.stop_recording()
+            except Exception as exc:
+                logger.exception(
+                    "call_teardown status=recording_flush_failed call_id={}", call_id
+                )
+                diagnostic_recorder.record(
+                    component="recording",
+                    code="recording.flush_failed",
+                    severity="error",
+                    outcome="degraded",
+                    safe_message="The final buffered call audio could not be flushed.",
+                    operator_detail=exc,
+                )
+            if recording_writer:
+                try:
+                    await recording_writer.finalize()
+                except Exception as exc:
+                    logger.exception(
+                        "call_teardown status=recording_finalize_failed call_id={}",
+                        call_id,
+                    )
+                    diagnostic_recorder.record(
+                        component="recording",
+                        code="recording.encode_failed",
+                        severity="error",
+                        outcome="degraded",
+                        safe_message="The call recording could not be finalized.",
+                        operator_detail=exc,
+                    )
+
+            if call_id:
+                drain_window = max(
+                    0.1,
+                    float(os.getenv("CALL_PERSISTENCE_DRAIN_SECONDS", "30")),
+                )
+                persistence_drained = await task_queue.wait_for_key(
+                    str(call_id), timeout=drain_window
+                )
+                await diagnostic_recorder.drain()
+                while not persistence_drained:
+                    # Keep the live heartbeat running and wait through a
+                    # transient database outage. Terminalization is the point
+                    # after which the immutable ledger cannot be repaired.
+                    logger.error(
+                        "call_teardown status=persistence_pending call_id={} action=keep_waiting",
+                        call_id,
+                    )
+                    persistence_drained = await task_queue.wait_for_key(
+                        str(call_id), timeout=drain_window
+                    )
+                if not call_activated and final_status == "completed":
+                    final_status = "failed"
+                    final_reason = "client_not_ready"
+                await finalize_call(
+                    call_id,
+                    status=final_status,
+                    end_reason=final_reason,
+                    ended_by=final_ended_by,
+                    ended_at=call_ended_at,
+                )
+        finally:
+            if call_id:
+                task_queue.unregister_rejection_handler(str(call_id))
+            if call_heartbeat_task and not call_heartbeat_task.done():
+                call_heartbeat_task.cancel()
+                await asyncio.gather(call_heartbeat_task, return_exceptions=True)
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+    """Guarantee that every authenticated startup failure becomes a call record."""
+    runner_session_id = str(
+        getattr(runner_args, "session_id", None) or uuid.uuid4()
+    )
+    try:
+        await _run_bot(transport, runner_args, runner_session_id)
+    except BaseException as exc:
+        try:
+            await fail_nonterminal_runner_call(runner_session_id, exc)
+        except Exception:
+            logger.exception(
+                "call_startup status=finalization_failed runner_session_id={}",
+                runner_session_id,
+            )
+        raise
 
 
 async def bot(runner_args: RunnerArguments):
@@ -487,13 +1001,17 @@ async def liveness_probe():
 @health_router.get("/health/ready")
 async def readiness_probe():
     from core.task_queue import task_queue
-    from core.readiness import validate_voice_provider_configuration
+    from core.readiness import (
+        validate_voice_provider_configuration,
+        validate_voice_runtime_readiness,
+    )
 
     if not task_queue.is_running:
         raise HTTPException(status_code=503, detail="background workers are not ready")
 
     try:
         providers = validate_voice_provider_configuration()
+        validate_voice_runtime_readiness(providers)
     except ValueError as exc:
         logger.warning("readiness voice provider configuration failed: {}", exc)
         raise HTTPException(status_code=503, detail=f"voice providers are not ready: {exc}") from exc
@@ -539,16 +1057,18 @@ if __name__ == "__main__":
         return await call_next(request)
 
     from api.auth import router as auth_router
-    from api.history import router as history_router
+    from api.calls import router as calls_router
     from api.memories import router as memories_router
     from api.rag_files import router as rag_files_router
     from api.telemetry import router as telemetry_router
+    from api.transport import router as transport_router
     
     app.include_router(auth_router)
-    app.include_router(history_router)
+    app.include_router(calls_router)
     app.include_router(memories_router)
     app.include_router(rag_files_router)
     app.include_router(telemetry_router)
+    app.include_router(transport_router)
     app.include_router(health_router)
     
     from contextlib import asynccontextmanager
@@ -580,9 +1100,22 @@ if __name__ == "__main__":
             raise
         event_loop_lag_monitor.start()
         task_queue.start(num_workers=3)
+        maintenance_in_api = os.getenv("CALL_MAINTENANCE_IN_API", "true").strip().lower() in {"1", "true", "yes"}
+        maintenance_stop = asyncio.Event()
+        maintenance_tasks = []
+        if maintenance_in_api:
+            from services.call_maintenance import call_maintenance_loop
+            maintenance_tasks = [
+                asyncio.create_task(call_maintenance_loop(maintenance_stop), name="call-maintenance"),
+                asyncio.create_task(recover_unfinished_recordings(), name="recording-recovery"),
+            ]
         try:
             yield
         finally:
+            maintenance_stop.set()
+            for maintenance_task in maintenance_tasks:
+                maintenance_task.cancel()
+            await asyncio.gather(*maintenance_tasks, return_exceptions=True)
             await asyncio.gather(
                 task_queue.stop(),
                 event_loop_lag_monitor.stop(),

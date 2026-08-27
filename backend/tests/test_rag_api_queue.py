@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -28,14 +29,14 @@ async def test_upload_persists_a_durable_queued_job(monkeypatch):
         async def refresh(self, _value):
             return None
 
-    async def store(data, object_name):
-        stored.append((data, object_name))
+    async def store(path, object_name, *, content_type):
+        stored.append((Path(path).read_bytes(), object_name, content_type))
         return f"local://uploads/{object_name}"
 
-    monkeypatch.setattr(storage.storage_client, "upload_file", store)
+    monkeypatch.setattr(storage.storage_client, "upload_rag_path", store)
     upload = UploadFile(
         filename="report.pdf",
-        file=BytesIO(b"%PDF-1.4 test"),
+        file=BytesIO(b"%PDF-1.4\n1 0 obj\n%%EOF"),
         headers={"content-type": "application/pdf"},
     )
 
@@ -47,4 +48,24 @@ async def test_upload_persists_a_durable_queued_job(monkeypatch):
 
     assert response.id == 17
     assert response.status == "queued"
-    assert stored == [(b"%PDF-1.4 test", "5/17.pdf")]
+    assert stored == [
+        (b"%PDF-1.4\n1 0 obj\n%%EOF", "5/17.pdf", "application/pdf")
+    ]
+
+
+@pytest.mark.anyio
+async def test_upload_rejects_spoofed_pdf_before_creating_job():
+    class Session:
+        def add(self, _value):
+            raise AssertionError("invalid input must not create a database job")
+
+    upload = UploadFile(
+        filename="report.pdf",
+        file=BytesIO(b"this is not a PDF"),
+        headers={"content-type": "application/pdf"},
+    )
+
+    with pytest.raises(Exception) as error:
+        await upload_file(upload, current_user=SimpleNamespace(id=5), db=Session())
+
+    assert getattr(error.value, "status_code", None) == 400

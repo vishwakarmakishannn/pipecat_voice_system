@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import time
 from collections.abc import Callable
@@ -21,7 +20,9 @@ from core.context_summary import (
     SUMMARY_SYSTEM_PROMPT,
 )
 from core.context_summary_config import VoiceContextSummaryConfig
+from core.assistant_output import contains_reserved_tool_markup
 from providers.llm.groq_llm import _groq_completion_settings
+from providers.llm.groq_runtime import get_shared_groq_client
 
 
 class StaleContextSummaryError(RuntimeError):
@@ -51,6 +52,8 @@ def sanitize_summary_messages(messages: list[dict]) -> list[dict[str, str]]:
             ).strip()
         if not content or QUERY_SCOPED_CONTEXT_MARKER in content:
             continue
+        if role == "assistant" and contains_reserved_tool_markup(content):
+            continue
         sanitized.append({"role": role, "content": content})
     return sanitized
 
@@ -59,6 +62,10 @@ class SafeGroqContextSummaryService(GroqLLMService):
     """Generate summaries on Groq and reject results after destructive edits."""
 
     supports_developer_role = False
+
+    def create_client(self, api_key=None, base_url=None, **kwargs):
+        del kwargs
+        return get_shared_groq_client(api_key=api_key, base_url=base_url)
 
     def __init__(
         self,
@@ -79,6 +86,7 @@ class SafeGroqContextSummaryService(GroqLLMService):
         self._summary_config = config
         self._mutation_epoch_getter = mutation_epoch_getter
         self._cooldown_until = 0.0
+        self.diagnostic_callback = None
 
     async def _generate_summary(self, frame) -> tuple[str, int]:
         now = time.monotonic()
@@ -120,7 +128,7 @@ class SafeGroqContextSummaryService(GroqLLMService):
                 round((time.monotonic() - started) * 1000, 1),
             )
             raise
-        except Exception:
+        except Exception as exc:
             self._cooldown_until = (
                 time.monotonic() + self._summary_config.retry_cooldown_seconds
             )
@@ -129,6 +137,16 @@ class SafeGroqContextSummaryService(GroqLLMService):
                 self._summary_config.model,
                 round((time.monotonic() - started) * 1000, 1),
             )
+            if self.diagnostic_callback:
+                self.diagnostic_callback(
+                    component="context_summary",
+                    code="context_summary.inference_failed",
+                    severity="warning",
+                    outcome="degraded",
+                    safe_message="Live context summarization failed; the active call continued with its existing context.",
+                    operator_detail=exc,
+                    retryable=True,
+                )
             raise
 
         if self._mutation_epoch_getter() != starting_epoch:
@@ -148,12 +166,9 @@ class SafeGroqContextSummaryService(GroqLLMService):
         return summary.strip(), selection.last_summarized_index
 
     async def close(self) -> None:
-        close = getattr(self._client, "close", None)
-        if not callable(close):
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
+        # The process-scoped Groq pool is owned by application lifespan, not a
+        # single call's context-summary service.
+        return None
 
 
 def build_context_summary_service(

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 import asyncio
+import ast
+from pathlib import Path
 
 import pytest
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -32,10 +34,26 @@ def summary_config(**overrides):
         "retry_cooldown_seconds": 30.0,
         "emergency_max_messages": 40,
         "emergency_max_chars": 24000,
-        "model": "llama-3.1-8b-instant",
+        "model": "openai/gpt-oss-20b",
     }
     values.update(overrides)
     return VoiceContextSummaryConfig(**values)
+
+
+def test_summary_persistence_handler_matches_pipecat_forwarded_event_arity():
+    tree = ast.parse((Path(__file__).parents[1] / "main.py").read_text())
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == "persist_applied_context_summary"
+    )
+
+    assert [argument.arg for argument in handler.args.args] == [
+        "aggregator",
+        "summarizer",
+        "event",
+    ]
 
 
 def test_pipecat_summary_params_use_dedicated_llm_and_marker():
@@ -88,6 +106,19 @@ def test_summary_sanitizer_excludes_query_scoped_and_tool_payloads():
         },
         {"role": "tool", "content": '{"large": "search payload"}'},
         {"role": "assistant", "content": "The report says the deadline is Friday."},
+    ]
+
+    assert sanitize_summary_messages(messages) == [messages[0], messages[-1]]
+
+
+def test_summary_sanitizer_excludes_simulated_tool_markup():
+    messages = [
+        {"role": "user", "content": "Search for it"},
+        {
+            "role": "assistant",
+            "content": '<function=tavily_search>{"query":"it"}</function>',
+        },
+        {"role": "assistant", "content": "A safe answer."},
     ]
 
     assert sanitize_summary_messages(messages) == [messages[0], messages[-1]]

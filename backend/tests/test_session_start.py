@@ -6,16 +6,16 @@ import services.memory as memory
 
 
 @pytest.mark.anyio
-async def test_voice_start_creates_missing_conversation(monkeypatch):
+async def test_voice_start_creates_new_call(monkeypatch):
     class Session:
-        def add(self, conversation):
-            self.conversation = conversation
+        def add(self, call):
+            self.call = call
 
         async def commit(self):
             return None
 
-        async def refresh(self, conversation):
-            conversation.id = 123
+        async def refresh(self, call):
+            call.id = "00000000-0000-0000-0000-000000000123"
 
         async def execute(self, _statement):
             return SimpleNamespace(scalar_one_or_none=lambda: None)
@@ -31,19 +31,10 @@ async def test_voice_start_creates_missing_conversation(monkeypatch):
     async def authenticate(_token, _db):
         return SimpleNamespace(id=7)
 
-    async def empty(*_args):
-        return []
-
-    async def no_prior(*_args):
-        return None
-
     monkeypatch.setattr(memory, "VoiceSessionLocal", SessionContext)
     monkeypatch.setattr(memory, "authenticate_token", authenticate)
-    monkeypatch.setattr(memory, "_load_active_facts", empty)
-    monkeypatch.setattr(memory, "_load_recent_messages_in_session", empty)
-    monkeypatch.setattr(memory, "_load_most_recent_prior_conversation", no_prior)
 
-    bundle = await memory.load_memory_bundle({"token": "token"})
+    bundle = await memory.load_session_bundle({"token": "token"})
 
-    assert bundle.primary_conversation.id == 123
-    assert bundle.primary_conversation.user_id == 7
+    assert bundle.call.id == "00000000-0000-0000-0000-000000000123"
+    assert bundle.call.user_id == 7

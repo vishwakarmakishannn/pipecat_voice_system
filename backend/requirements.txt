@@ -15,4 +15,4 @@ trafilatura
 tavily-python
 pywhispercpp>=1.5,<2
 mlx-whisper>=0.4.3,<0.5
-moonshine-voice>=0.1,<0.2
+moonshine-voice>=0.1.5,<0.2

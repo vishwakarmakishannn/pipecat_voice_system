@@ -13,6 +13,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 from core.audio_config import audio_output_sample_rate
+from core.log_safety import safe_text_metadata
 from providers.tts.config import get_text_aggregation_mode
 from providers.tts.kokoro_config import load_kokoro_config
 from providers.tts.kokoro_runtime import KokoroRuntime, get_kokoro_runtime
@@ -73,7 +74,7 @@ class LowLatencyKokoroTTSService(TTSService):
         context_id: str,
     ) -> AsyncGenerator[Frame, None]:
         """Synthesize one eager phrase without blocking the asyncio loop."""
-        logger.debug(f"{self}: Generating TTS [{text}]")
+        logger.debug("{}: Generating TTS text_meta={}", self, safe_text_metadata(text))
         try:
             await self.start_tts_usage_metrics(text)
             voice = assert_given(self._settings.voice)

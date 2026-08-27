@@ -80,10 +80,27 @@ async def test_login_uses_async_password_verification(monkeypatch):
     monkeypatch.setattr(auth, "verify_password_async", verify)
 
     token = await auth.login(
-        auth.UserCreate(username="alice", password="Secret123"),
+        auth.UserLogin(username="alice", password="Secret123"),
         _request(),
         Session(),
     )
 
     assert token["token_type"] == "bearer"
     assert verified == [("Secret123", "hash")]
+
+
+def test_registration_rejects_passwords_over_bcrypt_byte_limit():
+    with pytest.raises(ValueError, match="72 UTF-8 bytes"):
+        auth.UserCreate(username="valid_user", password="Password1" + "x" * 64)
+    with pytest.raises(ValueError, match="72 UTF-8 bytes"):
+        auth.UserCreate(username="valid_user", password="Password1" + "🙂" * 20)
+
+
+@pytest.mark.anyio
+async def test_overlong_login_password_is_a_safe_authentication_failure():
+    login = auth.UserLogin(
+        username="valid_user", password="Password1" + "x" * 100
+    )
+    hashed = await auth.get_password_hash_async("Password1")
+
+    assert await auth.verify_password_async(login.password, hashed) is False

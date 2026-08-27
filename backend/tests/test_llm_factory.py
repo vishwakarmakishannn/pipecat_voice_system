@@ -110,7 +110,7 @@ def test_local_failure_does_not_fall_back_to_cloud(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_lifecycle_only_warms_and_closes_local(monkeypatch):
+async def test_lifecycle_warms_and_closes_selected_process_runtime(monkeypatch):
     from providers.llm.factory import shutdown_llm_provider, warm_llm_provider
 
     calls = []
@@ -136,10 +136,24 @@ async def test_lifecycle_only_warms_and_closes_local(monkeypatch):
     assert calls == ["warm", "close"]
 
     calls.clear()
+    async def warm_groq():
+        calls.append("groq-warm")
+
+    async def close_groq():
+        calls.append("groq-close")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "providers.llm.groq_runtime",
+        SimpleNamespace(
+            warm_groq_runtime=warm_groq,
+            shutdown_groq_runtime=close_groq,
+        ),
+    )
     monkeypatch.setenv("LLM_PROVIDER", "groq")
     await warm_llm_provider()
     await shutdown_llm_provider()
-    assert calls == []
+    assert calls == ["groq-warm", "groq-close"]
 
 
 def test_google_builder_has_no_cross_provider_fallback(monkeypatch):
@@ -160,7 +174,8 @@ def test_google_builder_has_no_cross_provider_fallback(monkeypatch):
 
     assert captured["api_key"] == "google-key"
     assert "fallback_llm" not in captured
-    assert "hedge_delay_secs" not in captured
+    assert captured["hedge_delay_secs"] == 2.0
+    assert captured["warmup_timeout_secs"] == 2.0
 
 
 def test_openai_builder_uses_openai_env_and_tool_configuration(monkeypatch):
@@ -326,36 +341,24 @@ def test_groq_builder_validates_gpt_oss_reasoning_effort(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_groq_connection_warmup_uses_existing_client_and_fails_open():
-    from providers.llm.groq_llm import LatencyBoundGroqLLMService
+async def test_groq_runtime_reuses_zero_retry_client_and_closes_once():
+    from providers.llm.groq_runtime import (
+        get_shared_groq_client,
+        reset_groq_runtime_for_tests,
+        shutdown_groq_runtime,
+    )
 
-    class Models:
-        def __init__(self):
-            self.calls = 0
+    detached = reset_groq_runtime_for_tests()
+    for client in detached:
+        await client.close()
 
-        async def list(self):
-            self.calls += 1
-            return []
+    first = get_shared_groq_client(api_key="test-key")
+    second = get_shared_groq_client(api_key="test-key")
 
-    models = Models()
-    service = object.__new__(LatencyBoundGroqLLMService)
-    service._client = SimpleNamespace(models=models)
-    service._settings = SimpleNamespace(model="llama-3.1-8b-instant")
-    service._connection_warmed = False
-    service._warmup_attempted = False
+    assert first is second
+    assert first.max_retries == 0
+    assert first.is_closed() is False
 
-    assert await service.warm_connection(timeout_seconds=0.2) is True
-    assert await service.warm_connection(timeout_seconds=0.2) is True
-    assert models.calls == 1
-
-    async def fail():
-        raise OSError("network unavailable")
-
-    cold = object.__new__(LatencyBoundGroqLLMService)
-    cold._client = SimpleNamespace(models=SimpleNamespace(list=fail))
-    cold._settings = SimpleNamespace(model="llama-3.1-8b-instant")
-    cold._connection_warmed = False
-    cold._warmup_attempted = False
-
-    assert await cold.warm_connection(timeout_seconds=0.2) is False
-    assert cold.connection_warmed is False
+    await shutdown_groq_runtime()
+    assert first.is_closed() is True
+    await shutdown_groq_runtime()

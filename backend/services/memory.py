@@ -10,7 +10,7 @@ from typing import Any
 
 import jwt
 from loguru import logger
-from sqlalchemy import func, text
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -18,9 +18,11 @@ from sqlalchemy.future import select
 from api.auth import ALGORITHM, SECRET_KEY
 from core.database import AsyncSessionLocal, VoiceSessionLocal
 from core.memory_config import (
+    MEMORY_EMBEDDING_BATCH_SIZE,
     MEMORY_EMBEDDING_DIMENSION,
     MEMORY_EMBEDDING_CACHE_SIZE,
     MEMORY_EMBEDDING_CACHE_TTL_SECONDS,
+    MEMORY_EMBEDDING_RETRY_ATTEMPTS,
     MEMORY_FACTS_MAX_CHARS,
     MEMORY_SUMMARY_MAX_CHARS,
     MEMORY_RECENT_MAX_CHARS,
@@ -37,11 +39,21 @@ from core.memory_config import (
     PRIOR_CONVERSATION_MESSAGE_LIMIT,
     RECENT_MESSAGE_LIMIT,
 )
-from core.models import Conversation, MemoryChunk, Message, RagFile, User, UserMemory
+from core.assistant_output import (
+    contains_reserved_tool_markup,
+    is_memory_safe_assistant_text,
+)
+from core.models import Call, MemoryChunk, TranscriptEntry, RagFile, User, UserMemory
 from core.prompt_config import load_memory_prompt
 
 
-SINGLE_VALUE_KEYS = {"real_name", "preferred_name", "location", "role", "preferred_language"}
+SINGLE_VALUE_KEYS = {
+    "real_name",
+    "preferred_name",
+    "location",
+    "role",
+    "preferred_language",
+}
 MULTI_VALUE_KEYS = {"likes", "dislikes", "interests", "goals"}
 VALID_DURABILITY = {"stable", "temporary"}
 VALID_STATUSES = {"active", "inactive"}
@@ -64,7 +76,9 @@ _memory_llm_backoff_until = 0.0
 _google_client = None
 _openai_client = None
 _groq_client = None
-_embedding_cache: OrderedDict[tuple[str, str, str, int], tuple[float, list[float]]] = OrderedDict()
+_embedding_cache: OrderedDict[tuple[str, str, str, int], tuple[float, list[float]]] = (
+    OrderedDict()
+)
 _embedding_inflight: dict[tuple[str, str, str, int], asyncio.Task] = {}
 _embedding_lock = asyncio.Lock()
 
@@ -73,6 +87,7 @@ def _get_google_client():
     global _google_client
     if _google_client is None:
         from google import genai
+
         _google_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
     return _google_client
 
@@ -81,6 +96,7 @@ def _get_openai_client():
     global _openai_client
     if _openai_client is None:
         from openai import AsyncOpenAI
+
         _openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     return _openai_client
 
@@ -89,6 +105,7 @@ def _get_groq_client():
     global _groq_client
     if _groq_client is None:
         from openai import AsyncOpenAI
+
         _groq_client = AsyncOpenAI(
             api_key=os.getenv("GROQ_API_KEY"),
             base_url="https://api.groq.com/openai/v1",
@@ -118,25 +135,11 @@ def is_memory_fact_candidate(text_value: str) -> bool:
 @dataclass
 class MemoryBundle:
     user: User
-    primary_conversation: Conversation
+    call: Call
     facts: list[UserMemory]
-    primary_summary: str
-    primary_recent_messages: list[Message]
-    prior_conversation: Conversation | None = None
-    prior_recent_messages: list[Message] | None = None
+    prior_call: Call | None = None
+    prior_recent_transcripts: list[TranscriptEntry] | None = None
     has_ready_rag_corpus: bool = False
-
-    @property
-    def conversation(self) -> Conversation:
-        return self.primary_conversation
-
-    @property
-    def summary(self) -> str:
-        return self.primary_summary
-
-    @property
-    def recent_messages(self) -> list[Message]:
-        return self.primary_recent_messages
 
 
 def normalize_runner_body(body: Any) -> dict[str, Any]:
@@ -160,60 +163,43 @@ async def authenticate_token(token: str | None, db: AsyncSession) -> User | None
     return result.scalars().first()
 
 
-async def authenticate_conversation(
-    token: str | None,
-    conversation_id: int,
+async def _load_recent_transcripts(
     db: AsyncSession,
-) -> tuple[User, Conversation] | None:
-    if not token:
-        return None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-    except Exception as exc:
-        logger.warning(f"Memory auth failed: {exc}")
-        return None
-    if not username:
-        return None
-
-    result = await db.execute(
-        select(User, Conversation)
-        .join(Conversation, Conversation.user_id == User.id)
-        .where(
-            User.username == username,
-            Conversation.id == conversation_id,
-        )
-    )
-    row = result.first()
-    return (row[0], row[1]) if row else None
-
-
-async def _load_recent_messages(
-    db: AsyncSession,
-    conversation_id: int,
+    call_id,
     limit: int,
-) -> list[Message]:
+) -> list[TranscriptEntry]:
     result = await db.execute(
-        select(Message)
-        .where(Message.conversation_id == conversation_id, Message.role.in_(["You", "Aura"]))
-        .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(limit)
+        select(TranscriptEntry)
+        .where(
+            TranscriptEntry.call_id == call_id,
+            TranscriptEntry.speaker.in_(["You", "Aura"]),
+        )
+        .order_by(TranscriptEntry.created_at.desc(), TranscriptEntry.id.desc())
+        .limit(max(limit * 3, limit))
     )
-    return list(reversed(result.scalars().all()))
+    entries = [
+        entry
+        for entry in result.scalars().all()
+        if entry.speaker == "You"
+        or is_memory_safe_assistant_text(entry.text, entry.source)
+    ]
+    return list(reversed(entries[:limit]))
 
 
-async def _load_most_recent_prior_conversation(
+async def _load_most_recent_prior_call(
     db: AsyncSession,
     user_id: int,
-    current_conversation_id: int,
-) -> Conversation | None:
+    current_call_id,
+) -> Call | None:
     result = await db.execute(
-        select(Conversation)
+        select(Call)
         .where(
-            Conversation.user_id == user_id,
-            Conversation.id != current_conversation_id,
+            Call.user_id == user_id,
+            Call.id != current_call_id,
+            Call.deleted_at.is_(None),
+            Call.status.in_(("completed", "failed", "cancelled", "abandoned")),
         )
-        .order_by(Conversation.updated_at.desc(), Conversation.created_at.desc())
+        .order_by(Call.updated_at.desc(), Call.created_at.desc())
         .limit(1)
     )
     return result.scalars().first()
@@ -223,49 +209,57 @@ async def _load_active_facts(user_id: int) -> list[UserMemory]:
     async with VoiceSessionLocal() as db:
         result = await db.execute(
             select(UserMemory)
-            .where(UserMemory.user_id == user_id, UserMemory.status == "active")
-            .order_by(UserMemory.fact_type.asc(), UserMemory.key.asc(), UserMemory.updated_at.desc())
+            .outerjoin(
+                TranscriptEntry,
+                TranscriptEntry.id == UserMemory.source_transcript_id,
+            )
+            .outerjoin(Call, Call.id == TranscriptEntry.call_id)
+            .where(
+                UserMemory.user_id == user_id,
+                UserMemory.status == "active",
+                or_(
+                    UserMemory.source_transcript_id.is_(None),
+                    and_(
+                        Call.id.is_not(None),
+                        Call.deleted_at.is_(None),
+                        Call.status.in_(
+                            ("completed", "failed", "cancelled", "abandoned")
+                        ),
+                    ),
+                ),
+            )
+            .order_by(
+                UserMemory.fact_type.asc(),
+                UserMemory.key.asc(),
+                UserMemory.updated_at.desc(),
+            )
         )
         return list(result.scalars().all())
 
 
-async def _load_recent_messages_in_session(conversation_id: int, limit: int) -> list[Message]:
-    async with VoiceSessionLocal() as db:
-        return await _load_recent_messages(db, conversation_id, limit)
-
-
 async def load_session_bundle(body: Any) -> MemoryBundle | None:
-    """Authenticate and resolve the conversation without optional history I/O."""
+    """Authenticate and create one new immutable call for this voice session."""
     request_body = normalize_runner_body(body)
     token = request_body.get("token")
-    conversation_id = request_body.get("conversation_id")
     if not token:
         return None
 
-    if conversation_id is not None:
-        try:
-            conversation_id = int(conversation_id)
-        except (TypeError, ValueError):
-            logger.warning("Memory hydration skipped: invalid conversation_id")
-            return None
-
     async with VoiceSessionLocal() as db:
-        if conversation_id is None:
-            user = await authenticate_token(token, db)
-            if not user:
-                logger.warning("Memory hydration skipped: invalid token")
-                return None
-            conversation = Conversation(user_id=user.id, title="New conversation")
-            db.add(conversation)
-            await db.commit()
-            await db.refresh(conversation)
-            conversation_id = conversation.id
-        else:
-            authenticated = await authenticate_conversation(token, conversation_id, db)
-            if not authenticated:
-                logger.warning("Memory hydration skipped: invalid token or conversation ownership")
-                return None
-            user, conversation = authenticated
+        user = await authenticate_token(token, db)
+        if not user:
+            logger.warning("Call startup rejected: invalid token")
+            return None
+        call = Call(
+            user_id=user.id,
+            title="New call",
+            runner_session_id=str(request_body.get("_runner_session_id") or "") or None,
+            transport=str(request_body.get("_transport") or "webrtc")[:32],
+            direction="web",
+            status="initializing",
+        )
+        db.add(call)
+        await db.commit()
+        await db.refresh(call)
 
         user_id = user.id
         ready_rag_result = await db.execute(
@@ -277,12 +271,10 @@ async def load_session_bundle(body: Any) -> MemoryBundle | None:
 
     return MemoryBundle(
         user=user,
-        primary_conversation=conversation,
+        call=call,
         facts=[],
-        primary_summary=conversation.summary or "",
-        primary_recent_messages=[],
-        prior_conversation=None,
-        prior_recent_messages=None,
+        prior_call=None,
+        prior_recent_transcripts=None,
         has_ready_rag_corpus=has_ready_rag_corpus,
     )
 
@@ -291,36 +283,33 @@ async def hydrate_memory_bundle(
     bundle: MemoryBundle,
     recent_limit: int = RECENT_MESSAGE_LIMIT,
 ) -> MemoryBundle:
-    facts, recent_messages = await asyncio.gather(
-        _load_active_facts(bundle.user.id),
-        _load_recent_messages_in_session(bundle.conversation.id, recent_limit),
-    )
+    del recent_limit
+    facts = await _load_active_facts(bundle.user.id)
     return MemoryBundle(
         user=bundle.user,
-        primary_conversation=bundle.primary_conversation,
+        call=bundle.call,
         facts=facts,
-        primary_summary=bundle.primary_summary,
-        primary_recent_messages=recent_messages,
-        prior_conversation=bundle.prior_conversation,
-        prior_recent_messages=bundle.prior_recent_messages,
+        prior_call=None,
+        prior_recent_transcripts=None,
         has_ready_rag_corpus=bundle.has_ready_rag_corpus,
     )
 
 
-async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT) -> MemoryBundle | None:
-    """Compatibility helper for callers that require fully hydrated memory."""
-    bundle = await load_session_bundle(body)
-    if bundle is None:
-        return None
-    return await hydrate_memory_bundle(bundle, recent_limit)
-
-
-def message_to_llm(message: Message) -> dict[str, str] | None:
+def transcript_to_llm(entry: TranscriptEntry) -> dict[str, str] | None:
     role_map = {"You": "user", "Aura": "assistant"}
-    role = role_map.get(message.role)
+    role = role_map.get(entry.speaker)
     if not role:
         return None
-    return {"role": role, "content": message.content}
+    if entry.speaker == "Aura" and not is_memory_safe_assistant_text(
+        entry.text, entry.source
+    ):
+        return None
+    return {"role": role, "content": entry.text}
+
+
+def _safe_prior_summary(summary: str | None) -> str:
+    value = (summary or "").strip()
+    return "" if contains_reserved_tool_markup(value) else value
 
 
 def _clean_fact_value(value: str) -> str:
@@ -363,11 +352,11 @@ def _format_facts(facts: list[UserMemory]) -> str:
     return "\n".join(lines)[:MEMORY_FACTS_MAX_CHARS]
 
 
-def _recent_llm_messages(messages: list[Message]) -> list[dict[str, str]]:
+def _recent_llm_messages(messages: list[TranscriptEntry]) -> list[dict[str, str]]:
     selected: list[dict[str, str]] = []
     total_chars = 0
     for message in reversed(messages):
-        llm_message = message_to_llm(message)
+        llm_message = transcript_to_llm(message)
         if llm_message is None:
             continue
         content = llm_message["content"]
@@ -383,7 +372,9 @@ def _budget_memory_messages(messages: list[dict[str, str]]) -> list[dict[str, st
     """Deduplicate and fit memory under one approximate token budget."""
     max_chars = max(4, MEMORY_PROMPT_MAX_TOKENS * 4)
     developers = [message for message in messages if message.get("role") == "developer"]
-    conversation = [message for message in messages if message.get("role") != "developer"]
+    conversation = [
+        message for message in messages if message.get("role") != "developer"
+    ]
     selected_developers: list[dict[str, str]] = []
     seen: set[str] = set()
     used = 0
@@ -423,7 +414,7 @@ def _budget_memory_messages(messages: list[dict[str, str]]) -> list[dict[str, st
 
 
 def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
-    """Backward-compatible name for the mutable recent-dialogue seed."""
+    """Build the mutable context seed for one fresh call."""
     return build_live_context_messages(bundle)
 
 
@@ -435,21 +426,12 @@ def build_session_memory_context(bundle: MemoryBundle | None) -> str:
     facts = _format_facts(bundle.facts)
     if facts:
         sections.append(f"Stable user facts:\n{facts}")
-    if bundle.summary:
-        sections.append(
-            "Canonical conversation summary:\n"
-            f"{bundle.summary[:MEMORY_SUMMARY_MAX_CHARS]}"
-        )
     return "\n\n".join(sections)
 
 
 def build_live_context_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
-    """Seed mutable Pipecat context with recent dialogue only."""
-    if not bundle:
-        return []
-    return _budget_memory_messages(
-        _recent_llm_messages(bundle.primary_recent_messages)
-    )
+    """A new call never inherits another call's mutable transcript."""
+    return []
 
 
 def _extract_json_object(text_value: str) -> dict[str, Any]:
@@ -485,7 +467,9 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
             return None
         client = _get_google_client()
         response = await client.aio.models.generate_content(
-            model=os.getenv("GOOGLE_MEMORY_MODEL", os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")),
+            model=os.getenv(
+                "GOOGLE_MEMORY_MODEL", os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+            ),
             contents=prompt,
         )
         return getattr(response, "text", None)
@@ -496,8 +480,10 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
             return None
         client = _get_openai_client()
         response = await client.chat.completions.create(
-            model=os.getenv("OPENAI_MEMORY_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
-            messages=[{"role": "user", "content": prompt}]
+            model=os.getenv(
+                "OPENAI_MEMORY_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            ),
+            messages=[{"role": "user", "content": prompt}],
         )
         return response.choices[0].message.content
 
@@ -507,7 +493,9 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
             return None
         client = _get_groq_client()
         response = await client.chat.completions.create(
-            model=os.getenv("GROQ_MEMORY_MODEL", os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")),
+            model=os.getenv(
+                "GROQ_MEMORY_MODEL", os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            ),
             messages=[{"role": "user", "content": prompt}],
         )
         return response.choices[0].message.content
@@ -544,56 +532,208 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
         return None
 
 
-async def _embed_uncached(value: str, provider: str) -> list[float] | None:
-    def normalize_embedding(embedding: list[float] | None, provider: str) -> list[float] | None:
-        if not embedding:
-            return None
-        if len(embedding) != MEMORY_EMBEDDING_DIMENSION:
-            logger.warning(
-                f"{provider} embedding dimension {len(embedding)} does not match "
-                f"MEMORY_EMBEDDING_DIMENSION={MEMORY_EMBEDDING_DIMENSION}; skipping vector memory."
-            )
-            return None
-        return embedding
+def _embedding_model(provider: str) -> str:
+    if provider == "google":
+        return os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
+    if provider == "openai":
+        return os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    raise ValueError(f"Unsupported memory embedding provider: {provider!r}")
 
-    async def embed_google() -> list[float] | None:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key: return None
+
+def _normalize_embedding(embedding: list[float] | None, provider: str) -> list[float]:
+    if not embedding:
+        raise RuntimeError(f"{provider} returned an empty embedding")
+    if len(embedding) != MEMORY_EMBEDDING_DIMENSION:
+        raise RuntimeError(
+            f"{provider} embedding dimension {len(embedding)} does not match "
+            f"MEMORY_EMBEDDING_DIMENSION={MEMORY_EMBEDDING_DIMENSION}"
+        )
+    return list(embedding)
+
+
+async def _embed_batch_uncached(values: list[str], provider: str) -> list[list[float]]:
+    """Embed one batch in a single provider request, preserving input order."""
+    if not values:
+        return []
+    model = _embedding_model(provider)
+
+    if provider == "google":
+        if not os.getenv("GOOGLE_API_KEY"):
+            raise RuntimeError("GOOGLE_API_KEY is required for Google embeddings")
         from google.genai import types
-        client = _get_google_client()
-        model = os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
-        response = await client.aio.models.embed_content(
+
+        response = await _get_google_client().aio.models.embed_content(
             model=model,
-            contents=value,
-            config=types.EmbedContentConfig(output_dimensionality=MEMORY_EMBEDDING_DIMENSION)
+            contents=values,
+            config=types.EmbedContentConfig(
+                output_dimensionality=MEMORY_EMBEDDING_DIMENSION
+            ),
         )
-        return normalize_embedding(response.embeddings[0].values, "Google")
-
-    async def embed_openai() -> list[float] | None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key: return None
-        client = _get_openai_client()
-        model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        response = await client.embeddings.create(input=value, model=model)
-        return normalize_embedding(response.data[0].embedding, "OpenAI")
-
-    if provider == "disabled":
-        return None
-    generator = {
-        "google": embed_google,
-        "openai": embed_openai,
-    }.get(provider)
-    if generator is None:
+        embeddings = [item.values for item in response.embeddings]
+    elif provider == "openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI embeddings")
+        response = await _get_openai_client().embeddings.create(
+            input=values,
+            model=model,
+            dimensions=MEMORY_EMBEDDING_DIMENSION,
+        )
+        embeddings = [
+            item.embedding
+            for item in sorted(response.data, key=lambda item: item.index)
+        ]
+    else:
         raise ValueError(f"Unsupported memory embedding provider: {provider!r}")
-    try:
-        return await asyncio.wait_for(
-            generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5
+
+    if len(embeddings) != len(values):
+        raise RuntimeError(
+            f"{provider} returned {len(embeddings)} embeddings for {len(values)} inputs"
         )
+    return [_normalize_embedding(embedding, provider) for embedding in embeddings]
+
+
+def _embedding_retry_delay(exc: Exception, attempt: int) -> float | None:
+    message = str(exc)
+    retryable = any(
+        marker in message.lower()
+        for marker in (
+            "429",
+            "resource_exhausted",
+            "rate limit",
+            "timeout",
+            "timed out",
+            "500",
+            "502",
+            "503",
+            "504",
+            "unavailable",
+            "connection",
+        )
+    )
+    if not retryable:
+        return None
+    matches = re.findall(
+        r"(?:retry(?:delay)?[^0-9]{0,20})([0-9]+(?:\.[0-9]+)?)\s*s",
+        message,
+        flags=re.IGNORECASE,
+    )
+    requested = max((float(value) for value in matches), default=0.0)
+    return min(60.0, max(requested, float(2 ** max(0, attempt - 1))))
+
+
+async def _embed_uncached(value: str, provider: str) -> list[float] | None:
+    try:
+        result = await asyncio.wait_for(
+            _embed_batch_uncached([value], provider),
+            timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5,
+        )
+        return result[0]
     except Exception as exc:
-        # Never cross-fallback to another paid provider. The selected provider
-        # owns its availability, quota, and latency policy.
+        # Never cross-fallback to another provider: embeddings from different
+        # providers/models do not share a compatible vector space.
         logger.warning("{} embedding call failed: {}", provider, exc)
         return None
+
+
+def _cache_embedding(key: tuple[str, str, str, int], embedding: list[float]) -> None:
+    _embedding_cache[key] = (time.monotonic(), list(embedding))
+    _embedding_cache.move_to_end(key)
+    while len(_embedding_cache) > max(1, MEMORY_EMBEDDING_CACHE_SIZE):
+        _embedding_cache.popitem(last=False)
+
+
+async def embed_texts(
+    values: list[str],
+    *,
+    require_all: bool = False,
+) -> list[list[float] | None]:
+    """Embed many texts efficiently, optionally enforcing atomic completeness."""
+    normalized = [re.sub(r"\s+", " ", (value or "").strip()) for value in values]
+    results: list[list[float] | None] = [None] * len(normalized)
+    if not normalized or MEMORY_VECTOR_DB != "pgvector":
+        return results
+
+    provider = memory_embedding_provider()
+    if provider == "disabled":
+        return results
+    model = _embedding_model(provider)
+    positions: dict[str, list[int]] = {}
+    for index, value in enumerate(normalized):
+        if value:
+            positions.setdefault(value, []).append(index)
+
+    missing: list[str] = []
+    now = time.monotonic()
+    async with _embedding_lock:
+        for value, indexes in positions.items():
+            key = (provider, model, value, MEMORY_EMBEDDING_DIMENSION)
+            cached = _embedding_cache.get(key)
+            if cached and now - cached[0] <= MEMORY_EMBEDDING_CACHE_TTL_SECONDS:
+                _embedding_cache.move_to_end(key)
+                for index in indexes:
+                    results[index] = list(cached[1])
+            else:
+                if cached:
+                    _embedding_cache.pop(key, None)
+                missing.append(value)
+
+    completed: dict[str, list[float]] = {}
+    batch_size = max(1, MEMORY_EMBEDDING_BATCH_SIZE)
+    try:
+        for start in range(0, len(missing), batch_size):
+            batch = missing[start : start + batch_size]
+            last_error: Exception | None = None
+            for attempt in range(1, max(1, MEMORY_EMBEDDING_RETRY_ATTEMPTS) + 1):
+                try:
+                    embedded = await asyncio.wait_for(
+                        _embed_batch_uncached(batch, provider),
+                        timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5,
+                    )
+                    completed.update(zip(batch, embedded, strict=True))
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    delay = _embedding_retry_delay(exc, attempt)
+                    if delay is None or attempt >= max(
+                        1, MEMORY_EMBEDDING_RETRY_ATTEMPTS
+                    ):
+                        break
+                    logger.warning(
+                        "{} embedding batch attempt {}/{} failed; retrying in {:.1f}s: {}",
+                        provider,
+                        attempt,
+                        max(1, MEMORY_EMBEDDING_RETRY_ATTEMPTS),
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+            if last_error is not None:
+                raise last_error
+    except Exception as exc:
+        logger.warning("{} embedding batch failed: {}", provider, exc)
+        if require_all:
+            raise RuntimeError(
+                f"Could not create a complete {provider} embedding index; "
+                "the previous RAG index was preserved"
+            ) from exc
+        return [None] * len(normalized)
+
+    async with _embedding_lock:
+        for value, embedding in completed.items():
+            key = (provider, model, value, MEMORY_EMBEDDING_DIMENSION)
+            _cache_embedding(key, embedding)
+            for index in positions[value]:
+                results[index] = list(embedding)
+
+    if require_all and any(
+        value and results[index] is None for index, value in enumerate(normalized)
+    ):
+        raise RuntimeError(
+            f"Could not create a complete {provider} embedding index; "
+            "the previous RAG index was preserved"
+        )
+    return results
 
 
 async def embed_text(value: str) -> list[float] | None:
@@ -604,11 +744,7 @@ async def embed_text(value: str) -> list[float] | None:
     provider = memory_embedding_provider()
     if provider == "disabled":
         return None
-    model = (
-        os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
-        if provider == "google"
-        else os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-    )
+    model = _embedding_model(provider)
     key = (provider, model, value, MEMORY_EMBEDDING_DIMENSION)
     now = time.monotonic()
 
@@ -633,46 +769,54 @@ async def embed_text(value: str) -> list[float] | None:
 
     if embedding:
         async with _embedding_lock:
-            _embedding_cache[key] = (time.monotonic(), list(embedding))
-            _embedding_cache.move_to_end(key)
-            while len(_embedding_cache) > max(1, MEMORY_EMBEDDING_CACHE_SIZE):
-                _embedding_cache.popitem(last=False)
+            _cache_embedding(key, embedding)
         return list(embedding)
     return None
 
 
-def _transcript_lines(messages: list[Message], max_messages: int = 40) -> str:
+def _transcript_lines(messages: list[TranscriptEntry], max_messages: int = 40) -> str:
     lines = []
     for message in messages[-max_messages:]:
-        speaker = "User" if message.role == "You" else "Aura"
-        content = re.sub(r"\s+", " ", message.content or "").strip()
+        if message.speaker == "Aura" and not is_memory_safe_assistant_text(
+            message.text, message.source
+        ):
+            continue
+        speaker = "User" if message.speaker == "You" else "Aura"
+        content = re.sub(r"\s+", " ", message.text or "").strip()
         if len(content) > 500:
             content = content[:497].rstrip() + "..."
         lines.append(f"{speaker}: {content}")
     return "\n".join(lines)
 
 
-def _fallback_summary(messages: list[Message]) -> str:
+def _fallback_summary(messages: list[TranscriptEntry]) -> str:
     lines = []
     for message in messages[-20:]:
-        speaker = "User" if message.role == "You" else "Aura"
-        content = re.sub(r"\s+", " ", message.content or "").strip()
+        if message.speaker == "Aura" and not is_memory_safe_assistant_text(
+            message.text, message.source
+        ):
+            continue
+        speaker = "User" if message.speaker == "You" else "Aura"
+        content = re.sub(r"\s+", " ", message.text or "").strip()
         if len(content) > 180:
             content = content[:177].rstrip() + "..."
         lines.append(f"- {speaker}: {content}")
-    return "Recent voice conversation notes:\n" + "\n".join(lines)
+    return "Recent voice call notes:\n" + "\n".join(lines)
 
 
 def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
     action = str(event.get("action", "ignore")).lower()
     key = _normalize_key(str(event.get("key", "")))
     value = _normalize_value(str(event.get("value", "")), key)
-    fact_type = str(event.get("fact_type") or ("preference" if key in MULTI_VALUE_KEYS else "profile")).lower()
+    fact_type = str(
+        event.get("fact_type")
+        or ("preference" if key in MULTI_VALUE_KEYS else "profile")
+    ).lower()
     durability = str(event.get("durability", "stable")).lower()
     status = str(event.get("status", "active")).lower()
     try:
         confidence = float(event.get("confidence", 0))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         confidence = 0
 
     if action not in {"upsert", "deactivate", "ignore"}:
@@ -683,7 +827,10 @@ def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not key or not value:
         return None
-    if key in {"real_name", "preferred_name", "name"} and value.lower() in INVALID_NAME_VALUES:
+    if (
+        key in {"real_name", "preferred_name", "name"}
+        and value.lower() in INVALID_NAME_VALUES
+    ):
         return None
     if durability not in VALID_DURABILITY:
         durability = "stable"
@@ -706,15 +853,13 @@ def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-async def classify_memory_events(user_text: str, assistant_text: str | None = None) -> list[dict[str, Any]]:
+async def classify_memory_events(
+    user_text: str, assistant_text: str | None = None
+) -> list[dict[str, Any]]:
     if not is_memory_fact_candidate(user_text):
         return []
     base_prompt = load_memory_prompt()
-    prompt = (
-        f"{base_prompt}\n\n"
-        f"User: {user_text}\n"
-        f"Assistant: {assistant_text or ''}"
-    )
+    prompt = f"{base_prompt}\n\nUser: {user_text}\nAssistant: {assistant_text or ''}"
     response = await _generate_text_with_memory_llm(prompt)
     data = _extract_json_object(response or "")
     events = []
@@ -789,7 +934,7 @@ async def apply_fact_events(
             confidence=event["confidence"],
             durability=event["durability"],
             status="active",
-            source_message_id=source_message_id,
+            source_transcript_id=source_message_id,
             created_at=now,
             updated_at=now,
         )
@@ -799,33 +944,46 @@ async def apply_fact_events(
                 "confidence": event["confidence"],
                 "durability": event["durability"],
                 "status": "active",
-                "source_message_id": source_message_id,
+                "source_transcript_id": source_message_id,
                 "updated_at": now,
             },
         )
         await db.execute(stmt)
 
 
-def build_memory_chunk(conversation_id: int, messages: list[Message]) -> dict[str, Any] | None:
-    valid_messages = [message for message in messages if message.role in {"You", "Aura"} and message.content]
+def build_memory_chunk(
+    call_id, transcripts: list[TranscriptEntry]
+) -> dict[str, Any] | None:
+    valid_messages = [
+        entry
+        for entry in transcripts
+        if entry.speaker in {"You", "Aura"}
+        and entry.text
+        and (
+            entry.speaker == "You"
+            or is_memory_safe_assistant_text(entry.text, entry.source)
+        )
+    ]
     if not valid_messages:
         return None
 
     return {
-        "conversation_id": conversation_id,
-        "message_start_id": valid_messages[0].id,
-        "message_end_id": valid_messages[-1].id,
-        "chunk_text": _transcript_lines(valid_messages, max_messages=len(valid_messages)),
+        "call_id": call_id,
+        "transcript_start_id": valid_messages[0].id,
+        "transcript_end_id": valid_messages[-1].id,
+        "chunk_text": _transcript_lines(
+            valid_messages, max_messages=len(valid_messages)
+        ),
         "summary": _fallback_summary(valid_messages),
     }
 
 
 async def store_memory_chunk(
     db: AsyncSession,
-    conversation: Conversation,
-    messages: list[Message],
+    call: Call,
+    transcripts: list[TranscriptEntry],
 ) -> MemoryChunk | None:
-    chunk = build_memory_chunk(conversation.id, messages)
+    chunk = build_memory_chunk(call.id, transcripts)
     if not chunk:
         return None
 
@@ -835,10 +993,10 @@ async def store_memory_chunk(
 
     now = datetime.now(timezone.utc)
     stmt = insert(MemoryChunk).values(
-        user_id=conversation.user_id,
-        conversation_id=conversation.id,
-        message_start_id=chunk["message_start_id"],
-        message_end_id=chunk["message_end_id"],
+        user_id=call.user_id,
+        call_id=call.id,
+        transcript_start_id=chunk["transcript_start_id"],
+        transcript_end_id=chunk["transcript_end_id"],
         chunk_text=chunk["chunk_text"],
         summary=chunk["summary"],
         embedding=embedding,
@@ -846,7 +1004,7 @@ async def store_memory_chunk(
         updated_at=now,
     )
     stmt = stmt.on_conflict_do_update(
-        constraint="uq_memory_chunk_message_window",
+        constraint="uq_memory_chunk_transcript_window",
         set_={
             "chunk_text": chunk["chunk_text"],
             "summary": chunk["summary"],
@@ -868,23 +1026,23 @@ async def store_memory_chunk(
     return stored.scalars().first()
 
 
+_CROSS_CALL_RECALL_RE = re.compile(
+    r"\b(?:last time|previously|another (?:call|conversation|chat|session)|"
+    r"(?:previous|prior|earlier|past) (?:call|conversation|chat|session)|"
+    r"(?:call|conversation|chat|session) (?:before|from before)|"
+    r"past conversations?)\b",
+    re.IGNORECASE,
+)
+
+
 def is_recall_query(query: str) -> bool:
-    lowered = query.lower()
-    recall_terms = [
-        "what did",
-        "what was",
-        "previously",
-        "earlier",
-        "last time",
-        "remind me",
-        "remember",
-        "talk about",
-        "discuss",
-        "mentioned",
-        "i said",
-        "did i ask",
-    ]
-    return any(term in lowered for term in recall_terms)
+    """Return whether a turn explicitly requests cross-call episodic recall.
+
+    Current-call dialogue is already in the live LLM context. Broad wording
+    such as "I said" or "what did we discuss" must not trigger database and
+    embedding work unless the user clearly scopes it to an older call.
+    """
+    return bool(_CROSS_CALL_RECALL_RE.search(query or ""))
 
 
 async def retrieve_semantic_memories(
@@ -892,11 +1050,14 @@ async def retrieve_semantic_memories(
     query: str,
     top_k: int = MEMORY_RECALL_TOP_K,
     query_embedding=None,
+    current_call_id=None,
 ) -> list[tuple[MemoryChunk, float]]:
     if not is_recall_query(query):
         return []
 
-    if isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(query_embedding):
+    if isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(
+        query_embedding
+    ):
         embedding = await query_embedding
     elif query_embedding is not None:
         embedding = query_embedding
@@ -907,15 +1068,28 @@ async def retrieve_semantic_memories(
 
     try:
         async with VoiceSessionLocal() as db:
-            distance = MemoryChunk.embedding.cosine_distance(embedding).label("distance")
+            distance = MemoryChunk.embedding.cosine_distance(embedding).label(
+                "distance"
+            )
+            conditions = [
+                MemoryChunk.user_id == user_id,
+                MemoryChunk.embedding.is_not(None),
+                Call.deleted_at.is_(None),
+                Call.status.in_(("completed", "failed", "cancelled", "abandoned")),
+            ]
+            if current_call_id is not None:
+                conditions.append(Call.id != current_call_id)
             result = await db.execute(
                 select(MemoryChunk, distance)
-                .where(MemoryChunk.user_id == user_id, MemoryChunk.embedding.is_not(None))
+                .join(Call, Call.id == MemoryChunk.call_id)
+                .where(*conditions)
                 .order_by(distance)
                 .limit(top_k)
             )
             memories = []
             for chunk, dist in result.all():
+                if contains_reserved_tool_markup(chunk.summary or chunk.chunk_text):
+                    continue
                 score = 1 - float(dist)
                 if score >= MEMORY_RECALL_MIN_SCORE:
                     memories.append((chunk, score))
@@ -929,35 +1103,43 @@ async def build_turn_memory_context(
     user_id: int,
     query: str,
     query_embedding=None,
-    current_conversation_id: int | None = None,
+    current_call_id=None,
 ) -> str | None:
-    # Questions about the immediately preceding chat have a deterministic,
-    # local answer. Prefer that path over a remote embedding so cross-chat
-    # recall remains reliable inside the voice latency budget.
-    if is_recall_query(query) and current_conversation_id is not None:
+    # An explicit reference to the immediately preceding call has a fast,
+    # deterministic local path. Broader recall queries use semantic chunks.
+    immediate_recall = bool(
+        re.search(
+            r"\b(?:last time|previously|previous call|prior call|earlier call)\b",
+            query,
+            re.IGNORECASE,
+        )
+    )
+    if immediate_recall and current_call_id is not None:
         async with VoiceSessionLocal() as db:
-            prior_conversation = await _load_most_recent_prior_conversation(
+            prior_call = await _load_most_recent_prior_call(
                 db,
                 user_id,
-                current_conversation_id,
+                current_call_id,
             )
-            prior_messages = (
-                await _load_recent_messages(
+            prior_transcripts = (
+                await _load_recent_transcripts(
                     db,
-                    prior_conversation.id,
+                    prior_call.id,
                     PRIOR_CONVERSATION_MESSAGE_LIMIT,
                 )
-                if prior_conversation
+                if prior_call
                 else []
             )
-        if prior_messages:
+        if prior_transcripts:
             lines = [
-                "Relevant recent prior conversation retrieved on explicit recall. "
+                "Relevant recent prior call retrieved on explicit recall. "
                 "Use it only to answer the current recall question."
             ]
+            if summary := _safe_prior_summary(prior_call.summary):
+                lines.append(f"- Summary: {summary[:MEMORY_SUMMARY_MAX_CHARS]}")
             lines.extend(
-                f"- {'User' if message.role == 'You' else 'Aura'}: {message.content}"
-                for message in prior_messages
+                f"- {'User' if entry.speaker == 'You' else 'Aura'}: {entry.text}"
+                for entry in prior_transcripts
             )
             return "\n".join(lines)[:MEMORY_PRIOR_MAX_CHARS]
 
@@ -966,32 +1148,35 @@ async def build_turn_memory_context(
         query,
         MEMORY_RECALL_TOP_K,
         query_embedding=query_embedding,
+        current_call_id=current_call_id,
     )
     if not memories:
         if not is_recall_query(query):
             return None
         async with VoiceSessionLocal() as db:
-            prior_conversation = await _load_most_recent_prior_conversation(
+            prior_call = await _load_most_recent_prior_call(
                 db,
                 user_id,
-                current_conversation_id or -1,
+                current_call_id,
             )
-            if not prior_conversation:
+            if not prior_call:
                 return None
-            prior_messages = await _load_recent_messages(
+            prior_transcripts = await _load_recent_transcripts(
                 db,
-                prior_conversation.id,
+                prior_call.id,
                 PRIOR_CONVERSATION_MESSAGE_LIMIT,
             )
-        if not prior_messages:
+        if not prior_transcripts:
             return None
         lines = [
-            "Relevant recent prior conversation retrieved on explicit recall. "
+            "Relevant recent prior call retrieved on explicit recall. "
             "Use it only to answer the current recall question."
         ]
+        if summary := _safe_prior_summary(prior_call.summary):
+            lines.append(f"- Summary: {summary[:MEMORY_SUMMARY_MAX_CHARS]}")
         lines.extend(
-            f"- {'User' if message.role == 'You' else 'Aura'}: {message.content}"
-            for message in prior_messages
+            f"- {'User' if entry.speaker == 'You' else 'Aura'}: {entry.text}"
+            for entry in prior_transcripts
         )
         return "\n".join(lines)[:MEMORY_PRIOR_MAX_CHARS]
 
@@ -999,18 +1184,19 @@ async def build_turn_memory_context(
         "Relevant long-term episodic memories retrieved for this user. Use them only if relevant to the user's current question."
     ]
     for chunk, score in memories:
-        lines.append(f"- score={score:.2f} conversation={chunk.conversation_id}: {chunk.summary or chunk.chunk_text}")
+        content = chunk.summary or chunk.chunk_text
+        if contains_reserved_tool_markup(content):
+            continue
+        lines.append(f"- score={score:.2f} call={chunk.call_id}: {content}")
     return "\n".join(lines)
 
 
-async def maintain_memory_chunks_if_needed(
-    db: AsyncSession, conversation: Conversation
-) -> None:
+async def maintain_memory_chunks_if_needed(db: AsyncSession, call: Call) -> None:
     """Maintain episodic chunks; live Pipecat summaries own canonical summary."""
     count_result = await db.execute(
-        select(func.count(Message.id)).where(
-            Message.conversation_id == conversation.id,
-            Message.role.in_(["You", "Aura"]),
+        select(func.count(TranscriptEntry.id)).where(
+            TranscriptEntry.call_id == call.id,
+            TranscriptEntry.speaker.in_(["You", "Aura"]),
         )
     )
     message_count = count_result.scalar_one()
@@ -1018,102 +1204,34 @@ async def maintain_memory_chunks_if_needed(
     if message_count % 8 != 0:
         return
     recent_result = await db.execute(
-        select(Message)
-        .where(Message.conversation_id == conversation.id, Message.role.in_(["You", "Aura"]))
-        .order_by(Message.created_at.desc(), Message.id.desc())
+        select(TranscriptEntry)
+        .where(
+            TranscriptEntry.call_id == call.id,
+            TranscriptEntry.speaker.in_(["You", "Aura"]),
+        )
+        .order_by(TranscriptEntry.created_at.desc(), TranscriptEntry.id.desc())
         .limit(8)
     )
-    recent_messages = list(reversed(recent_result.scalars().all()))
-    if len(recent_messages) >= 2 and recent_messages[-1].role == "Aura":
-        await store_memory_chunk(db, conversation, recent_messages)
+    recent_transcripts = list(reversed(recent_result.scalars().all()))
+    if len(recent_transcripts) >= 2 and recent_transcripts[-1].speaker == "Aura":
+        await store_memory_chunk(db, call, recent_transcripts)
 
 
-async def save_conversation_summary(
-    conversation_id: int | None, summary: str
-) -> bool:
-    """Persist the one canonical summary after Pipecat applies it live."""
-    summary = (summary or "").strip()[:MEMORY_SUMMARY_MAX_CHARS]
-    if not conversation_id or not summary:
-        return False
+async def process_saved_transcript(call_id, transcript_id: int) -> None:
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Conversation).where(Conversation.id == conversation_id)
+        result = await db.execute(select(Call).where(Call.id == call_id))
+        call = result.scalars().first()
+        transcript_result = await db.execute(
+            select(TranscriptEntry).where(TranscriptEntry.id == transcript_id)
         )
-        conversation = result.scalars().first()
-        if not conversation:
-            logger.warning(
-                "Could not save context summary: conversation {} not found",
-                conversation_id,
-            )
-            return False
-        conversation.summary = summary
-        conversation.updated_at = datetime.now(timezone.utc)
-        await db.commit()
-    return True
+        entry = transcript_result.scalars().first()
 
+        if call and entry:
+            if entry.speaker == "You":
+                events = await classify_memory_events(entry.text)
+                await apply_fact_events(db, call.user_id, events, entry.id)
 
-async def save_conversation_message(
-    conversation_id: int | None,
-    role: str,
-    content: str,
-) -> Message | None:
-    content = (content or "").strip()
-    if not conversation_id or not content or role not in {"You", "Aura", "ToolCall", "RagCall"}:
-        return None
+            if entry.speaker == "Aura":
+                await maintain_memory_chunks_if_needed(db, call)
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
-        conversation = result.scalars().first()
-        if not conversation:
-            logger.warning(f"Could not save memory message: conversation {conversation_id} not found")
-            return None
-
-        message = Message(conversation_id=conversation_id, role=role, content=content)
-        db.add(message)
-        
-        # We need to update conversation title/updated_at here before commit
-        conversation.updated_at = datetime.now(timezone.utc)
-        if conversation.title == "New conversation" and message.role == "You":
-            new_title = " ".join(message.content.split()[:4])
-            conversation.title = new_title or conversation.title
-            
-        await db.commit()
-        await db.refresh(message)
-        
-    from core.task_queue import task_queue
-    task_queue.enqueue(
-        _process_saved_message_background,
-        conversation_id,
-        message.id,
-        key=conversation_id,
-        enrichment=True,
-    )
-    return message
-
-
-async def _process_saved_message_background(conversation_id: int, message_id: int):
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
-        conversation = result.scalars().first()
-        msg_result = await db.execute(select(Message).where(Message.id == message_id))
-        message = msg_result.scalars().first()
-        
-        if conversation and message:
-            if message.role == "You":
-                events = await classify_memory_events(message.content)
-                await apply_fact_events(db, conversation.user_id, events, message.id)
-        
-            if message.role == "Aura":
-                await maintain_memory_chunks_if_needed(db, conversation)
-            
             await db.commit()
-
-async def process_saved_message(db: AsyncSession, conversation: Conversation, message: Message) -> None:
-    from core.task_queue import task_queue
-    task_queue.enqueue(
-        _process_saved_message_background,
-        conversation.id,
-        message.id,
-        key=conversation.id,
-        enrichment=True,
-    )

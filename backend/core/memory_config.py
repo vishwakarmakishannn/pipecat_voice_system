@@ -4,14 +4,14 @@ import os
 def env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, default))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
 def env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, default))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -26,9 +26,11 @@ def memory_embedding_provider() -> str:
 
 
 def memory_llm_provider() -> str:
-    provider = os.getenv(
-        "MEMORY_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "google")
-    ).strip().lower()
+    provider = (
+        os.getenv("MEMORY_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "google"))
+        .strip()
+        .lower()
+    )
     if provider not in {"google", "groq", "local", "openai", "disabled"}:
         raise ValueError(
             "MEMORY_LLM_PROVIDER must be google, groq, local, openai, or "
@@ -46,7 +48,11 @@ MEMORY_RECALL_MIN_SCORE = env_float("MEMORY_RECALL_MIN_SCORE", 0.72)
 MEMORY_VECTOR_DB = os.getenv("MEMORY_VECTOR_DB", "pgvector").lower()
 MEMORY_EMBEDDING_PROVIDER = memory_embedding_provider()
 MEMORY_EMBEDDING_CACHE_SIZE = env_int("MEMORY_EMBEDDING_CACHE_SIZE", 256)
-MEMORY_EMBEDDING_CACHE_TTL_SECONDS = env_float("MEMORY_EMBEDDING_CACHE_TTL_SECONDS", 300.0)
+MEMORY_EMBEDDING_CACHE_TTL_SECONDS = env_float(
+    "MEMORY_EMBEDDING_CACHE_TTL_SECONDS", 300.0
+)
+MEMORY_EMBEDDING_BATCH_SIZE = env_int("MEMORY_EMBEDDING_BATCH_SIZE", 50)
+MEMORY_EMBEDDING_RETRY_ATTEMPTS = env_int("MEMORY_EMBEDDING_RETRY_ATTEMPTS", 3)
 MEMORY_FACTS_MAX_CHARS = env_int("MEMORY_FACTS_MAX_CHARS", 2000)
 MEMORY_SUMMARY_MAX_CHARS = env_int("MEMORY_SUMMARY_MAX_CHARS", 3000)
 MEMORY_RECENT_MAX_CHARS = env_int("MEMORY_RECENT_MAX_CHARS", 6000)

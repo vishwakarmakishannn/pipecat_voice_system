@@ -52,9 +52,14 @@ export default function ChunkInspector({ file, onClose }) {
 
         <div className="chunk-summary">
           <span>{total} chunks in vector DB</span>
+          <span>{file.ingestion_version || 'legacy-v1'}</span>
+          {file.extractor ? <span>Extractor: {file.extractor}</span> : null}
+          {typeof file.quality_score === 'number' ? <span>Quality: {Math.round(file.quality_score * 100)}%</span> : null}
           <span>Exact stored text</span>
           <span>Vector preview shows first 8 values</span>
         </div>
+
+        {file.ingestion_warnings?.length ? <div className="chunk-quality-warning">Extraction warnings: {file.ingestion_warnings.join('; ')}</div> : null}
 
         <main className="chunk-list">
           {loading ? <div className="chunk-state">Loading stored chunks…</div> : null}
@@ -73,7 +78,7 @@ export default function ChunkInspector({ file, onClose }) {
               {chunk.heading_path ? <div className="chunk-heading">{chunk.heading_path}</div> : null}
               <pre className="chunk-content">{chunk.content}</pre>
               <div className="chunk-vector">
-                <span>{chunk.content_chars.toLocaleString()} characters</span>
+                <span>{chunk.content_chars.toLocaleString()} characters · {chunk.token_count.toLocaleString()} tokens</span>
                 {chunk.embedding_preview.length ? <code>[{chunk.embedding_preview.map((value) => value.toFixed(5)).join(', ')}, …]</code> : null}
               </div>
             </article>

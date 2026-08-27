@@ -30,7 +30,7 @@ def _specific_timeout(name: str, default: float) -> float:
 
 def web_search_timeout_seconds() -> float:
     """Total deadline for all attempts made by one logical web search."""
-    return _specific_timeout("VOICE_WEB_SEARCH_TIMEOUT_SECONDS", 8.0)
+    return _specific_timeout("VOICE_WEB_SEARCH_TIMEOUT_SECONDS", 4.0)
 
 
 def web_search_attempt_timeout_seconds() -> float:
@@ -42,7 +42,7 @@ def web_search_attempt_timeout_seconds() -> float:
 
 
 def web_search_max_attempts() -> int:
-    raw = os.getenv("VOICE_WEB_SEARCH_MAX_ATTEMPTS", "2")
+    raw = os.getenv("VOICE_WEB_SEARCH_MAX_ATTEMPTS", "1")
     try:
         value = int(raw)
     except ValueError as exc:
@@ -85,7 +85,9 @@ def tool_filler_delay_seconds() -> float:
 
 
 def tool_filler_enabled() -> bool:
-    raw = os.getenv("VOICE_TOOL_FILLER_ENABLED", "true").strip().lower()
+    # Fillers open a separate TTS context and can queue ahead of the answer.
+    # Keep them opt-in; visual tool state remains available immediately.
+    raw = os.getenv("VOICE_TOOL_FILLER_ENABLED", "false").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:

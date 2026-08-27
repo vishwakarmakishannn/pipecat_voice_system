@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { ensureBotAudioPlayback } from '../src/utils/sessionTelemetry.js';
+import { ensureBotAudioPlayback, monitorRemoteAudioTrack } from '../src/utils/sessionTelemetry.js';
 
 function stream(track) {
   return { getAudioTracks: () => track ? [track] : [] };
@@ -78,4 +78,48 @@ test('bot playback preserves a genuine browser autoplay rejection', async () => 
     ensureBotAudioPlayback(expectedTrack),
     (error) => error.name === 'NotAllowedError',
   );
+});
+
+test('remote track analyser reports real audio without transport level events', () => {
+  let tick;
+  let cleared = false;
+  let closed = false;
+  const levels = [];
+  const track = {
+    kind: 'audio',
+    readyState: 'live',
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const analyser = {
+    fftSize: 0,
+    smoothingTimeConstant: 0,
+    getFloatTimeDomainData(samples) {
+      samples.fill(0.02);
+    },
+    disconnect() {},
+  };
+  class FakeAudioContext {
+    createMediaStreamSource() {
+      return { connect() {}, disconnect() {} };
+    }
+    createAnalyser() { return analyser; }
+    resume() { return Promise.resolve(); }
+    close() { closed = true; return Promise.resolve(); }
+  }
+
+  globalThis.MediaStream = class { constructor(tracks) { this.tracks = tracks; } };
+  globalThis.window = {
+    AudioContext: FakeAudioContext,
+    setInterval(callback) { tick = callback; return 7; },
+    clearInterval(id) { cleared = id === 7; },
+  };
+
+  const stop = monitorRemoteAudioTrack(track, (level) => levels.push(level));
+  tick();
+  stop();
+
+  assert.ok(levels[0] > 0.019);
+  assert.equal(cleared, true);
+  assert.equal(closed, true);
 });

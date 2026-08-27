@@ -105,9 +105,29 @@ def validate_voice_provider_configuration() -> dict[str, str]:
                 )
 
                 validate_kokoro_runtime()
-                load_kokoro_config()
+                kokoro_config = load_kokoro_config()
+                admitted_sessions = int(
+                    os.getenv("VOICE_MAX_CONCURRENT_SESSIONS", "8")
+                )
+                if kokoro_config.max_workers < admitted_sessions:
+                    errors.append(
+                        "KOKORO_MAX_WORKERS must be at least "
+                        "VOICE_MAX_CONCURRENT_SESSIONS so first audio does not "
+                        "queue behind another call"
+                    )
             except ValueError as exc:
                 errors.append(str(exc))
     if errors:
         raise ValueError("; ".join(errors))
     return selected
+
+
+def validate_voice_runtime_readiness(selected: dict[str, str]) -> None:
+    """Reject traffic when a selected remote runtime never completed warmup."""
+    if selected.get("llm") == "groq":
+        from providers.llm.groq_runtime import groq_runtime_warmed
+
+        if not groq_runtime_warmed():
+            raise ValueError(
+                "Groq connection warmup has not completed successfully"
+            )

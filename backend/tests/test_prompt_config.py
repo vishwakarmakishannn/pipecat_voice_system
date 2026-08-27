@@ -23,7 +23,6 @@ def test_search_query_planning_guardrail_exists_in_file_and_fallback_prompts():
         assert "evidence" in normalized
         assert "this-year" in normalized or "this year" in normalized
         assert "disput" in normalized
-        assert "regex-like keyword rule" in normalized
         assert "timeless" in normalized
 
 
@@ -47,7 +46,7 @@ def test_clock_tool_is_limited_to_time_and_deadline_tasks():
         assert "external facts" in normalized
 
 
-def test_read_only_tools_are_described_as_universally_available_with_auto_choice():
+def test_read_only_tools_describe_conditional_native_selection():
     obsolete_phrases = (
         "web-search tool is explicitly available",
         "when web search is available",
@@ -56,10 +55,34 @@ def test_read_only_tools_are_described_as_universally_available_with_auto_choice
     )
     for prompt in configured_prompts():
         normalized = prompt.lower()
-        assert "`tavily_search` tool is available on every normal user turn" in normalized
-        assert "`get_current_datetime` tool is available on every normal user turn" in normalized
-        assert "tool selection is automatic" in normalized
+        assert "when `tavily_search` is present" in normalized
+        assert "when present" in normalized
+        assert "never submit the latest utterance blindly" in normalized
         assert not any(phrase in normalized for phrase in obsolete_phrases)
+
+
+def test_uploaded_content_tool_handles_semantic_followups_and_truthful_timeouts():
+    for prompt in configured_prompts():
+        normalized = prompt.lower()
+        assert "search_uploaded_content" in normalized
+        assert "standalone query" in normalized
+        assert "full conversation" in normalized
+        assert "rag_retrieval_status" in normalized
+        assert "never claim" in normalized
+        assert "inaccessible" in normalized
+
+
+def test_issue_workflow_uses_semantic_tool_selection_without_disabling_search():
+    for prompt in configured_prompts():
+        normalized = prompt.lower()
+        assert "when `manage_issue_draft` is present" in normalized
+        assert "current meaning" in normalized
+        assert "tavily remains available" in normalized
+        assert "web search" in normalized
+        assert "leaves the draft unchanged" in normalized or "keep the draft unchanged" in normalized
+        assert "never confirms" in normalized or "never confirm" in normalized
+        assert "missing private" in normalized
+        assert "`raise_issue`" not in normalized
 
 
 def test_user_corrections_trigger_verification_but_are_not_treated_as_facts():
@@ -78,6 +101,16 @@ def test_spoken_answers_must_be_complete_instead_of_cut_off():
         assert "complete answer" in normalized
         assert "finish every sentence" in normalized
         assert "without cutting it off" in normalized
+
+
+def test_incomplete_voice_transcripts_are_clarified_without_persona_guessing():
+    for prompt in configured_prompts():
+        normalized = prompt.lower()
+        assert "voice transcripts can omit" in normalized
+        assert "clearly established recent context" in normalized
+        assert "never substitute your own name" in normalized
+        assert "clarifying question" in normalized
+        assert "instead of guessing" in normalized
 
 
 def test_session_memory_is_appended_once_as_untrusted_data(monkeypatch, tmp_path):

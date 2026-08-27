@@ -1,6 +1,7 @@
 import asyncio
+import os
+import tempfile
 from datetime import datetime
-from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -33,6 +34,10 @@ class RagFileResponse(BaseModel):
     final_url: str | None
     title: str | None
     site_name: str | None
+    ingestion_version: str
+    extractor: str | None
+    quality_score: float | None
+    ingestion_warnings: list[str]
     size_bytes: int
     status: str
     error: str | None
@@ -72,6 +77,8 @@ class RagChunkResponse(BaseModel):
     heading_path: str | None
     content: str
     content_chars: int
+    token_count: int
+    metadata: dict
     embedding_stored: bool
     embedding_dimension: int
     embedding_preview: list[float]
@@ -101,6 +108,10 @@ def _file_response(rag_file: RagFile, chunk_count: int = 0) -> RagFileResponse:
         final_url=rag_file.final_url,
         title=rag_file.title,
         site_name=rag_file.site_name,
+        ingestion_version=rag_file.ingestion_version or "legacy-v1",
+        extractor=rag_file.extractor,
+        quality_score=rag_file.quality_score,
+        ingestion_warnings=list(rag_file.ingestion_warnings or []),
         size_bytes=rag_file.size_bytes,
         status=rag_file.status,
         error=rag_file.error,
@@ -121,6 +132,36 @@ def _is_pdf_upload(file: UploadFile) -> bool:
     }
 
 
+async def _spool_pdf_upload(file: UploadFile, max_bytes: int) -> tuple[str, int]:
+    """Copy a bounded upload to disk and validate its PDF envelope."""
+    descriptor, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(descriptor)
+    size = 0
+    first_bytes = b""
+    tail = b""
+    try:
+        import aiofiles
+
+        async with aiofiles.open(path, "wb") as handle:
+            while chunk := await file.read(64 * 1024):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"PDF must be {RAG_MAX_UPLOAD_MB}MB or smaller",
+                    )
+                if len(first_bytes) < 1024:
+                    first_bytes = (first_bytes + chunk)[:1024]
+                tail = (tail + chunk)[-2048:]
+                await handle.write(chunk)
+        if not first_bytes.lstrip().startswith(b"%PDF-") or b"%%EOF" not in tail:
+            raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF")
+        return path, size
+    except BaseException:
+        await asyncio.to_thread(os.unlink, path)
+        raise
+
+
 def _chunk_response(chunk: RagChunk) -> RagChunkResponse:
     embedding = list(chunk.embedding) if chunk.embedding is not None else []
     return RagChunkResponse(
@@ -131,6 +172,8 @@ def _chunk_response(chunk: RagChunk) -> RagChunkResponse:
         heading_path=chunk.heading_path,
         content=chunk.content,
         content_chars=len(chunk.content),
+        token_count=chunk.token_count or 0,
+        metadata=chunk.metadata_json or {},
         embedding_stored=bool(embedding),
         embedding_dimension=len(embedding),
         embedding_preview=[float(value) for value in embedding[:8]],
@@ -164,30 +207,40 @@ async def upload_file(
     if not _is_pdf_upload(file):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
 
-    data = await file.read()
     max_bytes = RAG_MAX_UPLOAD_MB * 1024 * 1024
-    if len(data) > max_bytes:
-        raise HTTPException(status_code=413, detail=f"PDF must be {RAG_MAX_UPLOAD_MB}MB or smaller")
+    spool_path, size_bytes = await _spool_pdf_upload(file, max_bytes)
+    storage_path = None
+    try:
+        rag_file = RagFile(
+            user_id=current_user.id,
+            filename=normalize_pdf_filename(file.filename or "document.pdf"),
+            storage_path="",
+            mime_type="application/pdf",
+            source_type="pdf",
+            size_bytes=size_bytes,
+            status="queued",
+        )
+        db.add(rag_file)
+        await db.flush()
 
-    rag_file = RagFile(
-        user_id=current_user.id,
-        filename=normalize_pdf_filename(file.filename or "document.pdf"),
-        storage_path="",
-        mime_type=file.content_type or "application/pdf",
-        source_type="pdf",
-        size_bytes=len(data),
-        status="queued",
-    )
-    db.add(rag_file)
-    await db.flush()
+        from core.storage import storage_client
+        object_name = f"{current_user.id}/{rag_file.id}.pdf"
+        storage_path = await storage_client.upload_rag_path(
+            spool_path, object_name, content_type="application/pdf"
+        )
+        rag_file.storage_path = storage_path
 
-    from core.storage import storage_client
-    object_name = f"{current_user.id}/{rag_file.id}.pdf"
-    storage_path = await storage_client.upload_file(data, object_name)
-    rag_file.storage_path = storage_path
+        await db.commit()
+        await db.refresh(rag_file)
+    except BaseException:
+        await db.rollback()
+        if storage_path:
+            from core.storage import storage_client
 
-    await db.commit()
-    await db.refresh(rag_file)
+            await storage_client.delete_file(storage_path)
+        raise
+    finally:
+        await asyncio.to_thread(os.unlink, spool_path)
 
     return _file_response(rag_file, 0)
 

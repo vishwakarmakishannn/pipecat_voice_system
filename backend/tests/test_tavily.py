@@ -5,6 +5,7 @@ from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 import tools.tavily as tavily_module
+from tools.raise_issue import IssueWorkflowState
 
 
 def test_tavily_tool_tells_llm_to_create_a_contextual_standalone_query():
@@ -99,4 +100,40 @@ async def test_tavily_search_converts_empty_provider_result_to_terminal_error(mo
 
     assert delivered[0][0]["status"] == "error"
     assert delivered[0][0]["message"]
+    assert delivered[0][1].run_llm is True
+
+
+@pytest.mark.anyio
+async def test_tavily_remains_available_but_redacts_active_draft_values(monkeypatch):
+    searched = []
+    delivered = []
+
+    async def fake_search(query):
+        searched.append(query)
+        return {"query": query, "results": []}
+
+    async def capture(result, *, properties=None):
+        delivered.append((result, properties))
+
+    workflow = IssueWorkflowState(
+        status="collecting_fields",
+        cust_id="C001122",
+        mobile="9876543210",
+        device_id="MSW12345678",
+    )
+    monkeypatch.setattr(tavily_module, "run_web_search", fake_search)
+    params = SimpleNamespace(
+        result_callback=capture,
+        context=None,
+        app_resources={"issue_workflow": workflow},
+    )
+
+    await tavily_module.tavily_search(
+        params,
+        query="current Mswipe outages for MSW12345678 and customer C001122",
+    )
+
+    assert searched == ["current Mswipe outages for [redacted] and customer [redacted]"]
+    assert delivered[0][0]["query_sanitized"] is True
+    assert set(delivered[0][0]["redacted_fields"]) == {"cust_id", "device_id"}
     assert delivered[0][1].run_llm is True

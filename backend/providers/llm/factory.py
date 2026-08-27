@@ -33,13 +33,21 @@ def get_llm(system_instruction: str | None = None):
 
 async def warm_llm_provider() -> None:
     """Warm startup-only resources for the selected LLM provider."""
-    if _selected_provider() == "local":
+    provider = _selected_provider()
+    if provider == "local":
         from providers.local.llm.runtime import warm_local_llm_runtime
         await warm_local_llm_runtime()
+    elif provider == "groq":
+        from providers.llm.groq_runtime import warm_groq_runtime
+        await warm_groq_runtime()
 
 
 async def shutdown_llm_provider() -> None:
     """Release process-wide resources for the selected LLM provider."""
-    if _selected_provider() == "local":
+    provider = _selected_provider()
+    if provider == "local":
         from providers.local.llm.runtime import shutdown_local_llm_runtime
         await shutdown_local_llm_runtime()
+    elif provider == "groq":
+        from providers.llm.groq_runtime import shutdown_groq_runtime
+        await shutdown_groq_runtime()

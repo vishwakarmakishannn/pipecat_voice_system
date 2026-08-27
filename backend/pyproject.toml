@@ -9,7 +9,7 @@ description = "Pipecat RAG Voice Agent Backend"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "pipecat-ai[cartesia,daily,deepgram,openai,google,kokoro,silero,runner,webrtc,piper]>=0.0.44",
+    "pipecat-ai[cartesia,daily,deepgram,openai,google,kokoro,silero,runner,webrtc,piper]>=1.5,<1.6",
     "fastapi",
     "httpx",
     "uvicorn",
@@ -34,11 +34,12 @@ dependencies = [
     "pydantic",
     "pywhispercpp>=1.5,<2",
     "mlx-whisper>=0.4.3,<0.5",
-    "moonshine-voice>=0.1,<0.2"
+    "moonshine-voice>=0.1.5,<0.2"
 ]
 
 [project.optional-dependencies]
 rag-worker = [
+    "beautifulsoup4",
     "docling",
     "crawl4ai",
     "trafilatura",
@@ -71,4 +72,7 @@ packages = [
 testpaths = ["tests"]
 pythonpath = [
   "."
+]
+markers = [
+  "database: requires a migrated PostgreSQL + pgvector integration database",
 ]

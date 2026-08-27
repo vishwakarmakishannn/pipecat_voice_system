@@ -1,7 +1,12 @@
+import asyncio
 import os
 import aioboto3
 from loguru import logger
 import aiofiles
+import shutil
+from pathlib import Path
+
+from core.recording_config import local_recording_dir
 
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "")
@@ -42,6 +47,84 @@ class StorageClient:
                 await f.write(data)
             return f"local://{local_path}"
 
+    async def upload_path(
+        self,
+        source_path: str | Path,
+        object_name: str,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> str:
+        """Upload a file without materializing it as one in-memory byte string."""
+        source = Path(source_path)
+        if self.use_s3:
+            async with self.session.client(
+                "s3", endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None
+            ) as s3:
+                await s3.upload_file(
+                    str(source),
+                    S3_BUCKET,
+                    object_name,
+                    ExtraArgs={"ContentType": content_type},
+                )
+            return object_name
+        destination = local_recording_dir() / object_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.copyfile, source, destination)
+        return object_name
+
+    async def upload_rag_path(
+        self,
+        source_path: str | Path,
+        object_name: str,
+        *,
+        content_type: str = "application/pdf",
+    ) -> str:
+        """Store a RAG artifact without loading it into the API process."""
+        source = Path(source_path)
+        if self.use_s3:
+            async with self.session.client(
+                "s3", endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None
+            ) as s3:
+                await s3.upload_file(
+                    str(source),
+                    S3_BUCKET,
+                    object_name,
+                    ExtraArgs={"ContentType": content_type},
+                )
+            return object_name
+        destination = self.local_rag_object_path(object_name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.copyfile, source, destination)
+        return f"local://{destination}"
+
+    async def create_presigned_get_url(self, object_name: str, expires_seconds: int) -> str | None:
+        if not self.use_s3:
+            return None
+        async with self.session.client(
+            "s3", endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None
+        ) as s3:
+            return await s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": S3_BUCKET, "Key": object_name},
+                ExpiresIn=expires_seconds,
+            )
+
+    def local_object_path(self, object_name: str) -> Path:
+        root = local_recording_dir()
+        candidate = (root / object_name).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("Invalid recording object key")
+        return candidate
+
+    def local_rag_object_path(self, object_name: str) -> Path:
+        from core.rag_config import RAG_UPLOAD_DIR
+
+        root = Path(RAG_UPLOAD_DIR).expanduser().resolve()
+        candidate = (root / object_name).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("Invalid RAG object key")
+        return candidate
+
     async def download_file(self, object_name: str, local_path: str):
         """Download a file from an S3 bucket or local fallback"""
         if self.use_s3:
@@ -74,7 +157,6 @@ class StorageClient:
                 logger.error(f"Failed to delete {object_name} from S3: {e}")
                 # Don't throw for deletion, just log
         else:
-            from pathlib import Path
             if object_name.startswith("local://"):
                 src = object_name.replace("local://", "")
                 Path(src).unlink(missing_ok=True)
@@ -82,5 +164,15 @@ class StorageClient:
                 from core.rag_config import RAG_UPLOAD_DIR
                 src = Path(RAG_UPLOAD_DIR) / object_name
                 Path(src).unlink(missing_ok=True)
+
+    async def delete_file_strict(self, object_name: str) -> None:
+        """Delete an object and surface failures so retention jobs can retry."""
+        if self.use_s3:
+            async with self.session.client(
+                "s3", endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None
+            ) as s3:
+                await s3.delete_object(Bucket=S3_BUCKET, Key=object_name)
+            return
+        self.local_object_path(object_name).unlink(missing_ok=True)
 
 storage_client = StorageClient()

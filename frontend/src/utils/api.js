@@ -38,7 +38,6 @@ export async function apiRequest(endpoint, options = {}) {
     });
   
     if (res.status === 401 && auth) {
-      localStorage.removeItem('aura_token');
       window.dispatchEvent(new Event('logout'));
       throw new ApiError('Your session has expired. Please sign in again.', 401);
     }

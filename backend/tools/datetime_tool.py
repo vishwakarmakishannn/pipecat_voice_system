@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
+from pipecat.frames.frames import OutputTransportMessageUrgentFrame, TTSSpeakFrame
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN
 from pipecat.services.llm_service import (
     FunctionCallParams,
@@ -75,6 +76,35 @@ async def get_current_datetime(
         # tool repeatedly under automatic tool choice.
         context.set_tools([])
         context.set_tool_choice(NOT_GIVEN)
+    worker = getattr(params, "pipeline_worker", None)
+    if result.get("status") == "ok" and worker is not None:
+        spoken_text = (
+            f"It is {result.get('time', result.get('local_datetime', 'now'))} "
+            f"on {result.get('date', '')} in {result['timezone']}."
+        )
+        tool_call_id = getattr(params, "tool_call_id", None) or "datetime"
+        await worker.queue_frames([
+                # Queue speech before the dashboard transcript so a local
+                # deterministic answer needs no second LLM request.
+                TTSSpeakFrame(spoken_text, append_to_context=True),
+                OutputTransportMessageUrgentFrame({
+                    "label": "rtvi-ai",
+                    "type": "server-message",
+                    "data": {
+                        "type": "assistant_transcript",
+                        "payload": {
+                            "id": f"datetime-{tool_call_id}",
+                            "text": spoken_text,
+                            "source": "datetime_tool",
+                        },
+                    },
+                }),
+        ])
+        await params.result_callback(
+            result,
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        return
     await params.result_callback(
         result,
         properties=FunctionCallResultProperties(run_llm=True),
