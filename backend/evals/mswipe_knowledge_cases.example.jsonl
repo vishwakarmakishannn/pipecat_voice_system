@@ -1,0 +1,6 @@
+{"query":"Hello","expected_route":"conversation","expect_no_answer":true}
+{"query":"How do I activate my Mswipe POS?","expected_route":"knowledge","expected_unit_keys":["replace-with-approved-stable-key"]}
+{"query":"Why is settlement delayed and can you check mine?","expected_route":"mixed","expected_unit_keys":["replace-with-approved-stable-key"]}
+{"query":"Check my transaction status","expected_route":"live_lookup","expect_no_answer":true}
+{"query":"Raise a complaint ticket","expected_route":"action","expect_no_answer":true}
+{"query":"I want to speak to a human agent","expected_route":"human_handoff","expect_no_answer":true}

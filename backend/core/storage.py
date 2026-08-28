@@ -4,6 +4,7 @@ import aioboto3
 from loguru import logger
 import aiofiles
 import shutil
+import uuid
 from pathlib import Path
 
 from core.recording_config import local_recording_dir
@@ -97,6 +98,38 @@ class StorageClient:
         await asyncio.to_thread(shutil.copyfile, source, destination)
         return f"local://{destination}"
 
+    async def upload_knowledge_bytes(
+        self,
+        data: bytes,
+        object_name: str,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> str:
+        """Archive an immutable knowledge snapshot in private object storage."""
+        if self.use_s3:
+            import io
+
+            async with self.session.client(
+                "s3", endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None
+            ) as s3:
+                await s3.upload_fileobj(
+                    io.BytesIO(data),
+                    S3_BUCKET,
+                    object_name,
+                    ExtraArgs={"ContentType": content_type},
+                )
+            return object_name
+        destination = self.local_knowledge_object_path(object_name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            async with aiofiles.open(temporary, "wb") as handle:
+                await handle.write(data)
+            await asyncio.to_thread(os.replace, temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return f"local://{destination}"
+
     async def create_presigned_get_url(self, object_name: str, expires_seconds: int) -> str | None:
         if not self.use_s3:
             return None
@@ -123,6 +156,15 @@ class StorageClient:
         candidate = (root / object_name).resolve()
         if candidate != root and root not in candidate.parents:
             raise ValueError("Invalid RAG object key")
+        return candidate
+
+    def local_knowledge_object_path(self, object_name: str) -> Path:
+        from core.knowledge_config import KNOWLEDGE_STORAGE_DIR
+
+        root = Path(KNOWLEDGE_STORAGE_DIR).expanduser().resolve()
+        candidate = (root / object_name).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("Invalid knowledge object key")
         return candidate
 
     async def download_file(self, object_name: str, local_path: str):

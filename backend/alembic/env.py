@@ -4,7 +4,9 @@ import asyncio
 import os
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Deployment/CI process variables must win over a developer checkout's .env.
+# Overriding DATABASE_URL here can silently migrate the wrong database.
+load_dotenv(override=False)
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection

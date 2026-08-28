@@ -168,6 +168,8 @@ from core.processors import (
     transport_server_message,
 )
 from core.task_queue import task_queue
+from core.knowledge_config import KNOWLEDGE_ENABLED
+from core.knowledge_processor import MswipeKnowledgeProcessor
 
 
 async def _cancel_explicit_call(worker: PipelineWorker) -> None:
@@ -314,6 +316,16 @@ async def _run_bot(
         mutation_epoch=mutation_epoch,
         name="ContextRetrieval",
     )
+    mswipe_knowledge = (
+        MswipeKnowledgeProcessor(
+            context,
+            latency_state=latency_state,
+            mutation_epoch=mutation_epoch,
+            name="MswipeKnowledge",
+        )
+        if KNOWLEDGE_ENABLED
+        else None
+    )
     if hasattr(llm, "recovery_text_getter"):
         llm.recovery_text_getter = context_retrieval.timeout_recovery_text
     issue_workflow = IssueWorkflowState()
@@ -407,6 +419,8 @@ async def _run_bot(
     async def reset_query_scoped_turn_state(aggregator, strategy):
         latency_state.user_audio_offset_ms = audio_buffer.elapsed_ms
         context_retrieval.start_user_turn()
+        if mswipe_knowledge:
+            mswipe_knowledge.start_user_turn()
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def persist_complete_user_turn(aggregator, strategy, message):
@@ -458,8 +472,7 @@ async def _run_bot(
     )
 
     # Pipeline - assembled from reusable components
-    pipeline = Pipeline(
-        [
+    pipeline_processors = [
             transport.input(),
             stt,
             LatencyBoundaryProcessor(latency_state, "stt", name="PostSTTLatency"),
@@ -469,6 +482,7 @@ async def _run_bot(
             LatencyBoundaryProcessor(latency_state, "vad", name="PostVADLatency"),
             user_aggregator,
             LatencyBoundaryProcessor(latency_state, "turn", name="PostTurnLatency"),
+            *([mswipe_knowledge] if mswipe_knowledge else []),
             context_retrieval,
             tool_router,
             context_window,
@@ -489,7 +503,7 @@ async def _run_bot(
             CallUsageMetricsProcessor(latency_state, name="CallUsageMetrics"),
             assistant_aggregator,
         ]
-    )
+    pipeline = Pipeline(pipeline_processors)
 
     worker = PipelineWorker(
         pipeline,
@@ -1060,6 +1074,7 @@ if __name__ == "__main__":
     from api.calls import router as calls_router
     from api.memories import router as memories_router
     from api.rag_files import router as rag_files_router
+    from api.knowledge import router as knowledge_router
     from api.telemetry import router as telemetry_router
     from api.transport import router as transport_router
     
@@ -1067,6 +1082,7 @@ if __name__ == "__main__":
     app.include_router(calls_router)
     app.include_router(memories_router)
     app.include_router(rag_files_router)
+    app.include_router(knowledge_router)
     app.include_router(telemetry_router)
     app.include_router(transport_router)
     app.include_router(health_router)

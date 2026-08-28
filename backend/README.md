@@ -2,6 +2,10 @@
 
 This is the backend for the Pipecat RAG voice agent.
 
+The independent, release-controlled Mswipe production knowledge system is
+documented in [MSWIPE_KNOWLEDGE.md](MSWIPE_KNOWLEDGE.md). It is disabled by
+default and does not reuse the per-user `rag_files`/`rag_chunks` corpus.
+
 ## Local llama.cpp LLM
 
 The backend can use a separately managed, OpenAI-compatible `llama-server`.

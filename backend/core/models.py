@@ -11,10 +11,12 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import relationship
@@ -22,6 +24,7 @@ from pgvector.sqlalchemy import Vector
 from datetime import datetime, timezone
 from core.database import Base
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
+from core.knowledge_config import KNOWLEDGE_EMBEDDING_DIMENSION
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -56,6 +59,7 @@ class Call(Base):
         Index("idx_calls_user_llm_started", "user_id", "llm_provider", "llm_model", "started_at"),
         Index("idx_calls_user_tts_started", "user_id", "tts_provider", "tts_model", "started_at"),
         Index("idx_calls_purge_after", "purge_after"),
+        Index("idx_calls_purge_started", "purge_started_at"),
         Index("idx_calls_runner_session", "runner_session_id"),
     )
 
@@ -378,6 +382,305 @@ class RagChunk(Base):
 
     user = relationship("User", back_populates="rag_chunks")
     file = relationship("RagFile", back_populates="chunks")
+
+
+KNOWLEDGE_UNIT_TYPES = (
+    "faq",
+    "procedure",
+    "troubleshooting",
+    "product_spec",
+    "policy",
+    "definition",
+    "error_code",
+    "escalation_rule",
+    "contact_information",
+    "ticket_taxonomy",
+    "developer_reference",
+)
+
+
+class KnowledgeSource(Base):
+    __tablename__ = "knowledge_sources"
+    __table_args__ = (
+        CheckConstraint("authority BETWEEN 1 AND 5", name="ck_ks_authority"),
+        CheckConstraint(
+            "source_type IN ('website','pdf','internal','manual','taxonomy','api')",
+            name="ck_ks_type",
+        ),
+        Index("idx_ks_enabled_type", "enabled", "source_type"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False)
+    canonical_uri = Column(Text, nullable=False, unique=True)
+    source_type = Column(String(32), nullable=False)
+    authority = Column(Integer, nullable=False, default=3)
+    audience = Column(String(64), nullable=False, default="customer")
+    language = Column(String(16), nullable=False, default="en")
+    region = Column(String(32), nullable=False, default="IN")
+    owner = Column(String(255), nullable=True)
+    crawl_policy = Column(JSON, nullable=False, default=dict)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeSnapshot(Base):
+    __tablename__ = "knowledge_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','fetching','fetched','normalized','failed')",
+            name="ck_ksnap_status",
+        ),
+        UniqueConstraint("source_id", "content_hash", name="uq_ksnap_source_hash"),
+        Index("idx_ksnap_source_created", "source_id", "created_at"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=False)
+    requested_uri = Column(Text, nullable=False)
+    final_uri = Column(Text, nullable=True)
+    status = Column(String(24), nullable=False, default="queued")
+    http_status = Column(Integer, nullable=True)
+    content_type = Column(String(255), nullable=True)
+    etag = Column(String(255), nullable=True)
+    last_modified = Column(String(255), nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    raw_storage_key = Column(Text, nullable=True)
+    size_bytes = Column(BigInteger, nullable=False, default=0)
+    quality_score = Column(Float, nullable=True)
+    warnings = Column(JSON, nullable=False, default=list)
+    error = Column(Text, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", name="uq_kdoc_snapshot"),
+        Index("idx_kdoc_canonical_uri", "canonical_uri"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    snapshot_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_snapshots.id", ondelete="CASCADE"), nullable=False)
+    canonical_uri = Column(Text, nullable=False)
+    title = Column(Text, nullable=False)
+    canonical_markdown = Column(Text, nullable=False)
+    extractor = Column(String(64), nullable=False)
+    extractor_version = Column(String(64), nullable=True)
+    language = Column(String(16), nullable=False, default="en")
+    metadata_json = Column(JSON, nullable=False, default=dict)
+    quality_score = Column(Float, nullable=True)
+    warnings = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeUnit(Base):
+    __tablename__ = "knowledge_units"
+    __table_args__ = (
+        CheckConstraint(
+            "unit_type IN (" + ",".join(f"'{value}'" for value in KNOWLEDGE_UNIT_TYPES) + ")",
+            name="ck_ku_type",
+        ),
+        CheckConstraint("status IN ('draft','approved','retired')", name="ck_ku_status"),
+        CheckConstraint("authority BETWEEN 1 AND 5", name="ck_ku_authority"),
+        Index("idx_ku_status_type", "status", "unit_type"),
+        Index("idx_ku_product_topic", "product", "topic"),
+        Index("idx_ku_search_vector", "search_vector", postgresql_using="gin"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    stable_key = Column(String(255), nullable=False, unique=True)
+    document_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_documents.id", ondelete="SET NULL"), nullable=True)
+    unit_type = Column(String(32), nullable=False)
+    title = Column(Text, nullable=False)
+    question = Column(Text, nullable=True)
+    answer = Column(Text, nullable=False)
+    voice_answer = Column(Text, nullable=True)
+    retrieval_text = Column(Text, nullable=False)
+    product = Column(String(128), nullable=True)
+    device = Column(String(128), nullable=True)
+    topic = Column(String(128), nullable=True)
+    issue_family = Column(String(128), nullable=True)
+    intents = Column(JSON, nullable=False, default=list)
+    audience = Column(String(64), nullable=False, default="customer")
+    language = Column(String(16), nullable=False, default="en")
+    region = Column(String(32), nullable=False, default="IN")
+    authority = Column(Integer, nullable=False, default=3)
+    source_uri = Column(Text, nullable=False)
+    source_label = Column(String(255), nullable=False)
+    effective_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    requires_auth = Column(Boolean, nullable=False, default=False)
+    requires_live_api = Column(Boolean, nullable=False, default=False)
+    escalation_required = Column(Boolean, nullable=False, default=False)
+    ticket_candidates = Column(JSON, nullable=False, default=list)
+    metadata_json = Column(JSON, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+    status = Column(String(16), nullable=False, default="draft")
+    review_notes = Column(Text, nullable=True)
+    approved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    content_hash = Column(String(64), nullable=False)
+    search_vector = Column(TSVECTOR, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeEmbedding(Base):
+    __tablename__ = "knowledge_embeddings"
+    __table_args__ = (
+        UniqueConstraint("unit_id", "provider", "model", name="uq_kemb_unit_model"),
+        Index(
+            "idx_kemb_vector",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    unit_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_units.id", ondelete="CASCADE"), nullable=False)
+    provider = Column(String(32), nullable=False)
+    model = Column(String(255), nullable=False)
+    dimension = Column(Integer, nullable=False)
+    content_hash = Column(String(64), nullable=False)
+    embedding = Column(Vector(KNOWLEDGE_EMBEDDING_DIMENSION), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class KnowledgeAlias(Base):
+    __tablename__ = "knowledge_aliases"
+    __table_args__ = (
+        UniqueConstraint("canonical", "alias", "language", name="uq_kalias_value"),
+        Index("idx_kalias_alias_active", "alias", "active"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    canonical = Column(String(255), nullable=False)
+    alias = Column(String(255), nullable=False)
+    alias_type = Column(String(32), nullable=False, default="stt")
+    product = Column(String(128), nullable=True)
+    language = Column(String(16), nullable=False, default="en")
+    priority = Column(Integer, nullable=False, default=0)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class KnowledgeRelease(Base):
+    __tablename__ = "knowledge_releases"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft','published','retired')", name="ck_krel_status"),
+        Index(
+            "uq_krel_one_published",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+        ),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    version = Column(String(64), nullable=False, unique=True)
+    status = Column(String(16), nullable=False, default="draft")
+    description = Column(Text, nullable=True)
+    corpus_hash = Column(String(64), nullable=True)
+    unit_count = Column(Integer, nullable=False, default=0)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    retired_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeReleaseUnit(Base):
+    __tablename__ = "knowledge_release_units"
+    __table_args__ = (
+        PrimaryKeyConstraint("release_id", "unit_id", name="pk_krel_unit"),
+        Index("idx_krelunit_unit", "unit_id"),
+    )
+
+    release_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_releases.id", ondelete="CASCADE"), nullable=False)
+    unit_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_units.id", ondelete="RESTRICT"), nullable=False)
+    added_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class KnowledgeConflict(Base):
+    __tablename__ = "knowledge_conflicts"
+    __table_args__ = (
+        CheckConstraint("status IN ('open','resolved','ignored')", name="ck_kconf_status"),
+        UniqueConstraint("left_unit_id", "right_unit_id", "conflict_type", name="uq_kconf_pair"),
+        Index("idx_kconf_status", "status", "created_at"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    left_unit_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_units.id", ondelete="CASCADE"), nullable=False)
+    right_unit_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_units.id", ondelete="CASCADE"), nullable=False)
+    conflict_type = Column(String(32), nullable=False)
+    status = Column(String(16), nullable=False, default="open")
+    details = Column(JSON, nullable=False, default=dict)
+    resolution = Column(Text, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class KnowledgeJob(Base):
+    __tablename__ = "knowledge_jobs"
+    __table_args__ = (
+        CheckConstraint("status IN ('queued','running','succeeded','failed')", name="ck_kjob_status"),
+        Index("idx_kjob_claim", "status", "available_at", "created_at"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_type = Column(String(32), nullable=False)
+    status = Column(String(16), nullable=False, default="queued")
+    source_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=True)
+    snapshot_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_snapshots.id", ondelete="SET NULL"), nullable=True)
+    release_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_releases.id", ondelete="SET NULL"), nullable=True)
+    payload = Column(JSON, nullable=False, default=dict)
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeFeedback(Base):
+    __tablename__ = "knowledge_feedback"
+    __table_args__ = (Index("idx_kfeedback_created", "created_at"),)
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    call_id = Column(Uuid(as_uuid=True), ForeignKey("calls.id", ondelete="SET NULL"), nullable=True)
+    unit_id = Column(Uuid(as_uuid=True), ForeignKey("knowledge_units.id", ondelete="SET NULL"), nullable=True)
+    query_fingerprint = Column(String(64), nullable=False)
+    route = Column(String(32), nullable=False)
+    outcome = Column(String(32), nullable=False)
+    details = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class TicketTaxonomyEntry(Base):
+    __tablename__ = "ticket_taxonomy_entries"
+    __table_args__ = (
+        UniqueConstraint("ticket_code", "ticket_subcode", "remark", name="uq_ticket_taxonomy"),
+        Index("idx_ticket_taxonomy_active_code", "active", "ticket_code", "ticket_subcode"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ticket_code = Column(String(128), nullable=False)
+    ticket_subcode = Column(String(255), nullable=False)
+    remark = Column(Text, nullable=False)
+    source_status = Column(String(32), nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    content_hash = Column(String(64), nullable=False)
+    source_row = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
 
 class Issue(Base):

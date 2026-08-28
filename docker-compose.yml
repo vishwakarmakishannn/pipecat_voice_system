@@ -47,6 +47,7 @@ services:
       - RECORDING_SPOOL_DIR=/var/lib/aura/recording-spool
       - RECORDING_STORAGE_DIR=/var/lib/aura/recordings
       - RAG_UPLOAD_DIR=/var/lib/aura/rag
+      - MSWIPE_KNOWLEDGE_STORAGE_DIR=/var/lib/aura/mswipe-knowledge
       - PERSISTENCE_SPOOL_DIR=/var/lib/aura/persistence-spool
       - CALL_MAINTENANCE_IN_API=false
     env_file:
@@ -80,6 +81,25 @@ services:
       - RAG_UPLOAD_DIR=/var/lib/aura/rag
     env_file:
       - .env
+    volumes:
+      - call-artifacts:/var/lib/aura
+    restart: unless-stopped
+
+  knowledge-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: rag-runtime
+    container_name: pipecat_knowledge_worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-pipecat_user}:${POSTGRES_PASSWORD:-pipecat_password}@db:5432/${POSTGRES_DB:-pipecat_db}
+      - MSWIPE_KNOWLEDGE_STORAGE_DIR=/var/lib/aura/mswipe-knowledge
+    env_file:
+      - .env
+    command: ["python", "knowledge_worker.py"]
     volumes:
       - call-artifacts:/var/lib/aura
     restart: unless-stopped

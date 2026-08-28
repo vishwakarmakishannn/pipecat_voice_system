@@ -103,6 +103,38 @@ def _plain(value: str) -> str:
     return _space(value)
 
 
+def _deduplicate_blocks(blocks: list[DocumentBlock]) -> list[DocumentBlock]:
+    """Remove repeated responsive/hidden copies while preserving source order."""
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[DocumentBlock] = []
+    for block in blocks:
+        fingerprint = (block.kind, _plain(block.text).casefold())
+        if not fingerprint[1] or fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(replace(block, order=len(unique)))
+
+    normalized = [_plain(block.text).casefold() for block in unique]
+    compact: list[DocumentBlock] = []
+    for index, block in enumerate(unique):
+        text = normalized[index]
+        contained_elsewhere = (
+            block.kind != "heading"
+            and len(text) >= 15
+            and any(
+                other_index != index
+                and unique[other_index].kind != "heading"
+                and text != other
+                and text in other
+                for other_index, other in enumerate(normalized)
+            )
+        )
+        if not contained_elsewhere:
+            compact.append(replace(block, order=len(compact)))
+    return compact
+
+
 def clean_content(value: str) -> str:
     """Remove link targets and formatting while preserving record boundaries."""
     value = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value or "")
@@ -222,6 +254,12 @@ def canonical_document_from_html(
             continue
         if element.name == "p" and element.find_parent(["li", "blockquote"]) is not None:
             continue
+        if element.name in {"blockquote", "dt", "dd"} and element.find(
+            _BLOCK_TAGS - {element.name}
+        ):
+            # Emit the semantic child blocks, not both the container's combined
+            # text and each child again.
+            continue
 
         if element.name == "p":
             direct_links = element.find_all("a", recursive=False)
@@ -290,6 +328,8 @@ def canonical_document_from_html(
             blocks.append(
                 DocumentBlock(kind="paragraph", text=text, order=len(blocks))
             )
+
+    blocks = _deduplicate_blocks(blocks)
 
     document = CanonicalDocument(
         source_url=source_url,
