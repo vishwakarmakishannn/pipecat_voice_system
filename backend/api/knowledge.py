@@ -90,6 +90,9 @@ class FeedbackCreate(BaseModel):
 
 class UnitApproval(BaseModel):
     review_notes: str | None = Field(None, max_length=2000)
+    voice_answer: str | None = Field(None, min_length=1, max_length=4000)
+    atomic_answer: bool | None = None
+    answerability_reviewed: bool | None = None
 
 
 class UnitCreate(BaseModel):
@@ -421,10 +424,23 @@ async def admin_approve_unit(
             unit_id,
             approved_by_user_id=admin.id,
             review_notes=request.review_notes,
+            voice_answer=request.voice_answer,
+            atomic_answer=request.atomic_answer,
+            answerability_reviewed=request.answerability_reviewed,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"id": str(unit.id), "status": unit.status}
+    return {
+        "id": str(unit.id),
+        "status": unit.status,
+        "direct_answer_eligible": bool(
+            unit.voice_answer
+            and (unit.metadata_json or {}).get("atomic_answer") is True
+            and (unit.metadata_json or {}).get("answerability_reviewed") is True
+            and (unit.metadata_json or {}).get("voice_answer_approved") is True
+            and not unit.requires_live_api
+        ),
+    }
 
 
 @router.get("/admin/aliases")

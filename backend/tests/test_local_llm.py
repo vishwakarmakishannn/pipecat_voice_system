@@ -10,6 +10,7 @@ from providers.local.llm.config import LocalLLMConfig, load_local_llm_config
 from providers.local.llm.local_llm import LocalLLMService, _tool_schema_count
 from providers.local.llm import local_llm as local_llm_module
 from providers.local.llm.runtime import LocalLLMRuntime
+from tools.registry import configured_openai_tool_schemas
 
 
 async def iter_async(*items):
@@ -142,15 +143,17 @@ async def test_runtime_warms_once_under_concurrent_calls_and_closes():
         call["extra_body"]["id_slot"]
         for call in client.completions.calls
     ) == [0, 1]
-    assert [
+    warmup_tool_names = [
         tool["function"]["name"]
         for tool in client.completions.calls[0]["tools"]
-    ] == [
-        "get_current_datetime",
-        "search_uploaded_content",
-        "tavily_search",
-        "manage_issue_draft",
     ]
+    assert warmup_tool_names == [
+        schema["function"]["name"]
+        for schema in configured_openai_tool_schemas()
+    ]
+    assert "manage_issue_draft" in warmup_tool_names
+    assert "get_current_datetime" in warmup_tool_names
+    assert "tavily_search" not in warmup_tool_names
     assert client.completions.calls[0]["tool_choice"] == "auto"
 
     await runtime.close()

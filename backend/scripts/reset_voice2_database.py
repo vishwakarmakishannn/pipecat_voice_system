@@ -23,9 +23,6 @@ TABLE_ALLOWLIST = {
     "issues",
     "memory_chunks",
     "messages",
-    "rag_chunks",
-    "rag_files",
-    "rag_ingestion_jobs",
     "transcript_entries",
     "user_memories",
     "users",
@@ -43,7 +40,6 @@ def safe_database_target() -> str:
 
 def _safe_storage_roots() -> list[Path]:
     configured = (
-        os.getenv("RAG_UPLOAD_DIR", "uploads"),
         os.getenv("PERSISTENCE_SPOOL_DIR", "data/persistence-spool"),
         os.getenv("RECORDING_SPOOL_DIR", os.getenv("VOICE_RECORDING_SPOOL_DIR", "recording-spool")),
         os.getenv("RECORDING_STORAGE_DIR", os.getenv("VOICE_RECORDING_STORAGE_DIR", "recordings")),
@@ -79,14 +75,6 @@ async def collect_s3_objects() -> list[str]:
                 text("SELECT object_key FROM call_recordings WHERE object_key IS NOT NULL")
             )
             objects.update(str(value) for value in rows.scalars() if value)
-        if "rag_files" in existing:
-            rows = await connection.execute(
-                text("SELECT storage_path FROM rag_files WHERE storage_path <> ''")
-            )
-            for value in rows.scalars():
-                path = str(value or "")
-                if path and not path.startswith("local://"):
-                    objects.add("/".join(path.rstrip("/").split("/")[-2:]))
         return sorted(objects)
 
 

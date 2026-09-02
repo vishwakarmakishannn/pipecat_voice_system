@@ -25,6 +25,14 @@ class SourceSkipped(ValueError):
     """The source is valid, but policy says it must not be ingested."""
 
 
+class SourceHTTPError(ValueError):
+    """A public source responded, but did not return an ingestible success."""
+
+    def __init__(self, status: int):
+        self.status = status
+        super().__init__(f"Source returned HTTP {status}")
+
+
 @dataclass(frozen=True)
 class FetchResult:
     requested_url: str
@@ -104,7 +112,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
-def _request(url: str, max_bytes: int) -> tuple[int, object, bytes]:
+def _request(
+    url: str,
+    max_bytes: int,
+    conditional_headers: dict[str, str] | None = None,
+) -> tuple[int, object, bytes]:
     parsed, port, addresses = _resolve_public(url)
     path = parsed.path or "/"
     if parsed.query:
@@ -121,15 +133,17 @@ def _request(url: str, max_bytes: int) -> tuple[int, object, bytes]:
             )
         )
         try:
+            headers = {
+                "Host": host,
+                "User-Agent": KNOWLEDGE_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,application/pdf,text/plain;q=0.8",
+                "Connection": "close",
+            }
+            headers.update(conditional_headers or {})
             connection.request(
                 "GET",
                 path,
-                headers={
-                    "Host": host,
-                    "User-Agent": KNOWLEDGE_USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,application/pdf,text/plain;q=0.8",
-                    "Connection": "close",
-                },
+                headers=headers,
             )
             response = connection.getresponse()
             body = response.read(max_bytes + 1)
@@ -143,19 +157,32 @@ def _request(url: str, max_bytes: int) -> tuple[int, object, bytes]:
     raise ValueError("Could not safely fetch source") from last_error
 
 
-def _fetch_sync(url: str, max_redirects: int = 5) -> FetchResult:
+def _fetch_sync(
+    url: str,
+    max_redirects: int = 5,
+    conditional_headers: dict[str, str] | None = None,
+) -> FetchResult:
     requested = canonicalize_url(url)
     current = requested
     for redirect_number in range(max_redirects + 1):
-        status, raw_headers, content = _request(current, KNOWLEDGE_MAX_RESPONSE_BYTES)
+        status, raw_headers, content = _request(
+            current,
+            KNOWLEDGE_MAX_RESPONSE_BYTES,
+            conditional_headers,
+        )
         headers = {key.lower(): value for key, value in raw_headers.items()}
         if status in {301, 302, 303, 307, 308}:
             if redirect_number >= max_redirects or not headers.get("location"):
                 raise ValueError("Source redirected too many times or without a location")
             current = canonicalize_url(urljoin(current, headers["location"]))
+            # A validator belongs to the originally resolved representation.
+            # Do not send it to a different redirect target.
+            conditional_headers = None
             continue
+        if status == 304:
+            return FetchResult(requested, current, status, headers, b"", "utf-8")
         if not 200 <= status < 300:
-            raise ValueError(f"Source returned HTTP {status}")
+            raise SourceHTTPError(status)
         content_type = headers.get("content-type", "").lower()
         if not any(
             item in content_type
@@ -189,8 +216,23 @@ async def robots_allowed(url: str) -> bool:
     return parser.can_fetch(KNOWLEDGE_USER_AGENT, url)
 
 
-async def fetch_public_source(url: str) -> FetchResult:
+async def fetch_public_source(
+    url: str,
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> FetchResult:
     canonical = canonicalize_url(url)
     if not await robots_allowed(canonical):
         raise SourceSkipped("Source ingestion is disallowed by robots.txt")
-    return await asyncio.to_thread(_fetch_sync, canonical)
+    conditional_headers = {}
+    if etag:
+        conditional_headers["If-None-Match"] = etag
+    if last_modified:
+        conditional_headers["If-Modified-Since"] = last_modified
+    return await asyncio.to_thread(
+        _fetch_sync,
+        canonical,
+        5,
+        conditional_headers or None,
+    )

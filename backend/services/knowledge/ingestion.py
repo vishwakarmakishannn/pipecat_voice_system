@@ -13,6 +13,7 @@ from urllib.parse import unquote, urljoin, urlparse
 from xml.etree import ElementTree
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import or_
 from sqlalchemy.future import select
 
 from core.knowledge_config import (
@@ -29,11 +30,20 @@ from core.models import (
 from services.document_ingestion import (
     canonical_document_from_html,
     canonical_document_from_markdown,
+    canonical_document_from_structured_html,
+    canonical_document_from_trafilatura,
     canonical_document_to_markdown,
     chunk_canonical_document,
+    merge_structured_document,
     score_document,
+    select_best_document,
 )
-from services.knowledge.fetch import SourceSkipped, canonicalize_url, fetch_public_source
+from services.knowledge.fetch import (
+    SourceHTTPError,
+    SourceSkipped,
+    canonicalize_url,
+    fetch_public_source,
+)
 from services.knowledge.units import UnitInput, upsert_draft_unit
 
 
@@ -45,9 +55,11 @@ class IngestionReport:
     pages_skipped: int
     pages_excluded_from_units: int
     pages_failed: int
+    pages_warned: int
     units_created_or_updated: int
     duplicate_draft_units_retired: int
     errors: tuple[str, ...]
+    page_outcomes: tuple[dict, ...]
 
 
 @dataclass(frozen=True)
@@ -69,7 +81,10 @@ _DEFAULT_EXCLUDED_UNIT_PATH_PREFIXES = (
     "/knowledge",
     "/mswipe-career",
 )
-_EXTRACTOR_VERSION = "3"
+_EXTRACTOR_VERSION = "4"
+_CHUNK_POLICY_VERSION = os.getenv(
+    "MSWIPE_KNOWLEDGE_CHUNK_POLICY_VERSION", "structure-v2"
+).strip()
 
 
 def _unit_generation_excluded(url: str, crawl_policy: dict) -> bool:
@@ -102,6 +117,33 @@ def _dedupe_fingerprint(answer: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _simhash(answer: str) -> tuple[int, int]:
+    tokens = re.findall(r"[\w-]+", answer.casefold())
+    features = [" ".join(tokens[index : index + 3]) for index in range(len(tokens) - 2)]
+    if not features:
+        features = tokens
+    vector = [0] * 64
+    for feature in features:
+        fingerprint = int.from_bytes(
+            hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest(),
+            "big",
+        )
+        for bit in range(64):
+            vector[bit] += 1 if fingerprint & (1 << bit) else -1
+    value = sum(1 << bit for bit, weight in enumerate(vector) if weight >= 0)
+    return value, len(tokens)
+
+
+def _near_duplicate(left: str, right: str) -> bool:
+    left_hash, left_length = _simhash(left)
+    right_hash, right_length = _simhash(right)
+    if min(left_length, right_length) < 12:
+        return False
+    if min(left_length, right_length) / max(left_length, right_length) < 0.9:
+        return False
+    return (left_hash ^ right_hash).bit_count() <= 2
+
+
 def _dedupe_preference(unit: KnowledgeUnit) -> tuple:
     parsed = urlparse(unit.source_uri)
     support_rank = 0 if parsed.path.rstrip("/") == "/support" else 1
@@ -124,9 +166,25 @@ async def _retire_duplicate_draft_units(db: AsyncSession, source_id) -> int:
             KnowledgeUnit.status.in_(("draft", "approved")),
         )
     )
+    units = result.scalars().all()
     groups: dict[str, list[KnowledgeUnit]] = {}
-    for unit in result.scalars().all():
+    for unit in units:
         groups.setdefault(_dedupe_fingerprint(unit.answer), []).append(unit)
+
+    # Merge only extremely close, same-type records. The narrow SimHash radius
+    # catches punctuation/responsive-copy drift without collapsing different
+    # product claims that merely share vocabulary.
+    representatives = [items[0] for items in groups.values()]
+    for index, left in enumerate(representatives):
+        left_key = _dedupe_fingerprint(left.answer)
+        if left_key not in groups:
+            continue
+        for right in representatives[index + 1 :]:
+            right_key = _dedupe_fingerprint(right.answer)
+            if right_key not in groups or left.unit_type != right.unit_type:
+                continue
+            if _near_duplicate(left.answer, right.answer):
+                groups[left_key].extend(groups.pop(right_key))
 
     retired = 0
     for duplicates in groups.values():
@@ -179,25 +237,37 @@ def _discover_links(html: str, base_url: str) -> list[str]:
 
 async def _discover_sitemap_urls(root_url: str) -> list[str]:
     parsed = urlparse(root_url)
-    sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
-    try:
-        fetched = await fetch_public_source(sitemap_url)
-        root = ElementTree.fromstring(fetched.content)
-    except Exception:
-        return []
+    queue = deque([f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"])
+    visited_sitemaps: set[str] = set()
     discovered: set[str] = set()
-    for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "loc" or not element.text:
+    # A recursive index can be arbitrarily large. The website page limit still
+    # bounds ingestion, while this separate cap prevents an index-only crawl.
+    sitemap_limit = 50
+    while queue and len(visited_sitemaps) < sitemap_limit:
+        sitemap_url = queue.popleft()
+        if sitemap_url in visited_sitemaps:
             continue
+        visited_sitemaps.add(sitemap_url)
         try:
-            candidate = canonicalize_url(element.text.strip())
-        except ValueError:
+            fetched = await fetch_public_source(sitemap_url)
+            root = ElementTree.fromstring(fetched.content)
+        except Exception:
             continue
-        if (
-            urlparse(candidate).hostname == parsed.hostname
-            and _is_concrete_page_url(candidate)
-        ):
-            discovered.add(candidate)
+        is_index = root.tag.rsplit("}", 1)[-1] == "sitemapindex"
+        for element in root.iter():
+            if element.tag.rsplit("}", 1)[-1] != "loc" or not element.text:
+                continue
+            try:
+                candidate = canonicalize_url(element.text.strip())
+            except ValueError:
+                continue
+            if urlparse(candidate).hostname != parsed.hostname:
+                continue
+            if is_index:
+                if candidate not in visited_sitemaps:
+                    queue.append(candidate)
+            elif _is_concrete_page_url(candidate):
+                discovered.add(candidate)
     return sorted(discovered)
 
 
@@ -238,7 +308,29 @@ async def _ingest_html_page(
     source: IngestionSource,
     url: str,
 ) -> tuple[str, int, list[str]]:
-    fetched = await fetch_public_source(url)
+    previous_result = await db.execute(
+        select(KnowledgeSnapshot)
+        .where(
+            KnowledgeSnapshot.source_id == source.id,
+            or_(
+                KnowledgeSnapshot.requested_uri == url,
+                KnowledgeSnapshot.final_uri == url,
+            ),
+            KnowledgeSnapshot.status == "normalized",
+        )
+        .order_by(KnowledgeSnapshot.fetched_at.desc())
+        .limit(1)
+    )
+    previous_snapshot = previous_result.scalars().first()
+    fetched = await fetch_public_source(
+        url,
+        etag=previous_snapshot.etag if previous_snapshot else None,
+        last_modified=(
+            previous_snapshot.last_modified if previous_snapshot else None
+        ),
+    )
+    if fetched.status == 304:
+        return "unchanged", 0, []
     content_hash = hashlib.sha256(fetched.content).hexdigest()
     existing = await db.execute(
         select(KnowledgeSnapshot).where(
@@ -316,10 +408,25 @@ async def _ingest_html_page(
             )
         else:
             html = fetched.content.decode(fetched.charset, errors="replace")
-            document, signals = canonical_document_from_html(
+            semantic_document, signals = canonical_document_from_html(
                 html, fetched.final_url, extractor="semantic_html_v1"
             )
-            document = score_document(document, signals)
+            candidates = [semantic_document]
+            trafilatura_document = await asyncio.to_thread(
+                canonical_document_from_trafilatura,
+                html,
+                fetched.final_url,
+                title=semantic_document.title,
+                site_name=semantic_document.site_name,
+            )
+            if trafilatura_document is not None:
+                candidates.append(trafilatura_document)
+            document = select_best_document(candidates, signals)
+            structured_document = canonical_document_from_structured_html(
+                html,
+                fetched.final_url,
+            )
+            document = merge_structured_document(document, structured_document)
         markdown = canonical_document_to_markdown(document)
         warnings = list(document.warnings)
         if not markdown.strip():
@@ -360,12 +467,28 @@ async def _ingest_html_page(
         current_unit_ids = []
         for index, chunk in enumerate(chunks):
             title = chunk.heading_path or document.title or f"Mswipe information {index + 1}"
+            structured_types = {
+                record.get("structured_type")
+                for record in chunk.metadata.get("source_records", [])
+                if record.get("structured_type")
+            }
+            unit_type = (
+                "faq"
+                if structured_types == {"faq"}
+                else "procedure"
+                if structured_types == {"procedure"}
+                else "product_spec"
+                if structured_types == {"table_record"}
+                else _unit_type(title, chunk.content)
+            )
+            identity_text = f"{title.casefold()}|{unit_type}"
+            unit_key = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:16]
             current_unit = await upsert_draft_unit(
                 db,
                 UnitInput(
-                    stable_key=f"web.{url_key}.{index}",
+                    stable_key=f"web.{url_key}.{unit_key}",
                     document_id=record.id,
-                    unit_type=_unit_type(title, chunk.content),
+                    unit_type=unit_type,
                     title=title,
                     question=title if title.endswith("?") else None,
                     answer=chunk.content,
@@ -376,7 +499,14 @@ async def _ingest_html_page(
                     region=source.region,
                     audience=source.audience,
                     authority=source.authority,
-                    metadata={"heading_path": chunk.heading_path, **chunk.metadata},
+                    metadata={
+                        "heading_path": chunk.heading_path,
+                        "chunk_policy_version": _CHUNK_POLICY_VERSION,
+                        "atomic_answer": unit_type == "faq",
+                        "answerability_reviewed": False,
+                        "voice_answer_approved": False,
+                        **chunk.metadata,
+                    },
                 ),
             )
             current_unit_ids.append(current_unit.id)
@@ -446,8 +576,9 @@ async def crawl_website_source(
     queue = deque((url, 0) for url in dict.fromkeys(seed_urls))
     seen: set[str] = set()
     discovered = set(seed_urls)
-    ingested = unchanged = skipped = excluded = failed = unit_count = 0
+    ingested = unchanged = skipped = excluded = failed = warned = unit_count = 0
     errors: list[str] = []
+    page_outcomes: list[dict] = []
     while queue and len(seen) < page_limit:
         url, depth = queue.popleft()
         if url in seen:
@@ -462,16 +593,43 @@ async def crawl_website_source(
                 excluded += 1
             else:
                 unchanged += 1
+            page_outcomes.append({"url": url, "outcome": status})
             if depth < depth_limit:
                 new_links = [link for link in links if link not in discovered]
                 discovered.update(new_links)
                 queue.extend((link, depth + 1) for link in new_links)
-        except SourceSkipped:
+        except SourceSkipped as exc:
             skipped += 1
+            page_outcomes.append(
+                {"url": url, "outcome": "policy_skipped", "reason": str(exc)}
+            )
+        except SourceHTTPError as exc:
+            if exc.status == 404:
+                warned += 1
+                page_outcomes.append(
+                    {
+                        "url": url,
+                        "outcome": "source_warning",
+                        "reason": "stale_http_404",
+                    }
+                )
+            else:
+                failed += 1
+                errors.append(f"{url}: {type(exc).__name__}: {exc}")
+                page_outcomes.append(
+                    {"url": url, "outcome": "failed", "reason": f"http_{exc.status}"}
+                )
         except Exception as exc:
             await db.rollback()
             failed += 1
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
+            page_outcomes.append(
+                {
+                    "url": url,
+                    "outcome": "failed",
+                    "reason": type(exc).__name__,
+                }
+            )
         finally:
             if KNOWLEDGE_CRAWL_DELAY_SECONDS:
                 await asyncio.sleep(KNOWLEDGE_CRAWL_DELAY_SECONDS)
@@ -483,7 +641,9 @@ async def crawl_website_source(
         pages_skipped=skipped,
         pages_excluded_from_units=excluded,
         pages_failed=failed,
+        pages_warned=warned,
         units_created_or_updated=unit_count,
         duplicate_draft_units_retired=duplicate_units_retired,
         errors=tuple(errors[:100]),
+        page_outcomes=tuple(page_outcomes[:page_limit]),
     )

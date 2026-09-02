@@ -1,12 +1,13 @@
 """Live capability gate for a candidate Groq voice-orchestration model.
 
-This command intentionally evaluates planning only; it never executes Tavily or
-another write-capable tool. Run it before promoting a Groq model in production.
+This command intentionally evaluates planning only; it never executes retrieval
+or a write-capable tool. Run it before promoting a Groq model in production.
 """
 
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
 import os
 import sys
@@ -17,8 +18,6 @@ from dotenv import load_dotenv
 from core.assistant_output import contains_reserved_tool_markup
 from core.prompt_config import load_system_prompt
 from providers.llm.groq_runtime import get_shared_groq_client, shutdown_groq_runtime
-from tools.datetime_tool import openai_datetime_tool_schema
-from tools.tavily import openai_tavily_tool_schema
 
 
 @dataclass(frozen=True)
@@ -32,15 +31,15 @@ class EvaluationCase:
 
 CASES = (
     EvaluationCase(
-        name="timeless_no_search",
+        name="timeless_general_answer",
         messages=[{"role": "user", "content": "What is the full form of AI?"}],
         expected_tool=None,
     ),
     EvaluationCase(
-        name="current_search",
-        messages=[{"role": "user", "content": "Search the current Dell G15 price in India."}],
-        expected_tool="tavily_search",
-        query_terms=("dell", "g15", "price"),
+        name="mswipe_product_knowledge",
+        messages=[{"role": "user", "content": "How does Mswipe Soundbox work?"}],
+        expected_tool="search_mswipe_knowledge",
+        query_terms=("mswipe", "soundbox"),
     ),
     EvaluationCase(
         name="ambiguous_reference_clarifies",
@@ -49,14 +48,32 @@ CASES = (
         clarification_terms=("which", "what", "refer", "them"),
     ),
     EvaluationCase(
-        name="correction_builds_contextual_query",
+        name="mswipe_followup_builds_contextual_query",
         messages=[
-            {"role": "user", "content": "I was thinking of buying a Samsung Galaxy A30s."},
-            {"role": "assistant", "content": "It has a 48MP main camera."},
-            {"role": "user", "content": "You are wrong with the camera specs."},
+            {"role": "user", "content": "Tell me about the Mswipe Soundbox."},
+            {"role": "assistant", "content": "What would you like to know?"},
+            {"role": "user", "content": "How is it installed?"},
         ],
-        expected_tool="tavily_search",
-        query_terms=("galaxy", "a30s", "camera"),
+        expected_tool="search_mswipe_knowledge",
+        query_terms=("mswipe", "soundbox", "install"),
+    ),
+    EvaluationCase(
+        name="complaint_starts_state_machine",
+        messages=[{
+            "role": "user",
+            "content": "Please raise a complaint because my card payments keep failing.",
+        }],
+        expected_tool="manage_issue_draft",
+        query_terms=("start", "payments"),
+    ),
+    EvaluationCase(
+        name="current_external_fact_without_web",
+        messages=[{
+            "role": "user",
+            "content": "Who is the current Prime Minister of India?",
+        }],
+        expected_tool=None,
+        clarification_terms=("cannot", "can't", "unable", "verify"),
     ),
 )
 
@@ -92,18 +109,21 @@ def evaluate_message(case: EvaluationCase, message) -> tuple[bool, dict]:
     }
 
 
-async def main() -> int:
+async def main(case_name: str | None = None) -> int:
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+    from tools.registry import configured_openai_tool_schemas
+
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         print("GROQ_API_KEY is required for the live capability evaluation.", file=sys.stderr)
         return 2
     model = os.getenv("GROQ_EVALUATION_MODEL", os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")).strip()
     client = get_shared_groq_client(api_key=api_key)
-    tools = [openai_datetime_tool_schema(), openai_tavily_tool_schema()]
+    tools = configured_openai_tool_schemas()
+    selected_cases = [case for case in CASES if case_name in {None, case.name}]
     results = []
     try:
-        for case in CASES:
+        for case in selected_cases:
             try:
                 completion = await client.chat.completions.create(
                     model=model,
@@ -141,4 +161,13 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    parser = argparse.ArgumentParser(
+        description="Evaluate semantic planning with no tool execution."
+    )
+    parser.add_argument(
+        "--case",
+        choices=[case.name for case in CASES],
+        help="Run one case instead of the complete capability gate.",
+    )
+    args = parser.parse_args()
+    raise SystemExit(asyncio.run(main(args.case)))

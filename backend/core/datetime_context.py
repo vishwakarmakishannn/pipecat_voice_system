@@ -43,5 +43,5 @@ def session_date_context(
         "No clock time is injected. When exact current time, a timezone "
         "conversion, or a deadline based on now is required, use the "
         "get_current_datetime tool. This metadata does not make model knowledge "
-        "current; use tavily_search for current news or external facts."
+        "current or verify external facts."
     )

@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 
-from providers.stt.deepgram_stt import ResilientDeepgramSTTService
+from providers.stt.deepgram_stt import (
+    ResilientDeepgramSTTService,
+    deepgram_stt_settings,
+)
 
 
 class _FailingConnection:
@@ -22,6 +25,27 @@ class _RecordingConnection:
 
     async def send_media(self, audio):
         self.media.append(audio)
+
+
+def test_numeric_formatting_settings_are_explicit_and_validated(monkeypatch):
+    monkeypatch.setenv("DEEPGRAM_STT_MODEL", "nova-3-general")
+    monkeypatch.setenv("DEEPGRAM_STT_LANGUAGE", "en")
+    monkeypatch.setenv("DEEPGRAM_STT_NUMERALS", "true")
+    monkeypatch.setenv("DEEPGRAM_STT_SMART_FORMAT", "true")
+
+    settings = deepgram_stt_settings()
+
+    assert settings.model == "nova-3-general"
+    assert settings.language == "en"
+    assert settings.numerals is True
+    assert settings.smart_format is True
+
+
+def test_invalid_numeric_formatting_setting_fails_at_startup(monkeypatch):
+    monkeypatch.setenv("DEEPGRAM_STT_NUMERALS", "sometimes")
+
+    with pytest.raises(ValueError, match="DEEPGRAM_STT_NUMERALS"):
+        deepgram_stt_settings()
 
 
 @pytest.mark.anyio

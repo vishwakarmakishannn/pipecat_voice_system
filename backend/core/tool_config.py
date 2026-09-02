@@ -4,6 +4,20 @@ import os
 WEB_SEARCH_TOOL_TIMEOUT_MARGIN_SECONDS = 1.0
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
+
+def web_search_enabled() -> bool:
+    """Keep external web access an explicit deployment capability."""
+    return _boolean("WEB_SEARCH_ENABLED", False)
+
+
 def tool_timeout_seconds() -> float:
     raw = os.getenv("VOICE_TOOL_TIMEOUT_SECONDS", "3")
     try:
@@ -87,9 +101,16 @@ def tool_filler_delay_seconds() -> float:
 def tool_filler_enabled() -> bool:
     # Fillers open a separate TTS context and can queue ahead of the answer.
     # Keep them opt-in; visual tool state remains available immediately.
-    raw = os.getenv("VOICE_TOOL_FILLER_ENABLED", "false").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"VOICE_TOOL_FILLER_ENABLED must be a boolean, got {raw!r}")
+    return _boolean("VOICE_TOOL_FILLER_ENABLED", False)
+
+
+def tool_filler_text() -> str:
+    """Return the short deployment-configured phrase spoken before a tool call."""
+    value = " ".join(
+        os.getenv("VOICE_TOOL_FILLER_TEXT", "Let me look that up for you.").split()
+    )
+    if not value:
+        raise ValueError("VOICE_TOOL_FILLER_TEXT must not be empty")
+    if len(value) > 120:
+        raise ValueError("VOICE_TOOL_FILLER_TEXT must be at most 120 characters")
+    return value

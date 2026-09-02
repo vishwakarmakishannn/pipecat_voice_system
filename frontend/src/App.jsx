@@ -18,7 +18,7 @@ import { collectWebRTCAudioStats, createSessionTelemetry, ensureBotAudioPlayback
 import { addLatencySample } from './utils/liveLatency';
 import './App.css';
 import { CallDetailPage, CallsPage } from './components/CallPages';
-import { FilesPage, MemoriesPage } from './components/ResourcePages';
+import { MemoriesPage } from './components/ResourcePages';
 
 const START_ENDPOINT =
   import.meta.env.VITE_PIPECAT_START_URL ||
@@ -695,22 +695,7 @@ function VoiceApp({ onResetClient }) {
         upsertToolCall(messageData.payload);
         return;
       }
-      if (messageData?.type !== 'rag_call' || !messageData.payload) return;
-      const payload = messageData.payload;
-      const ragCallId = payload.rag_call_id || `rag-${Date.now()}`;
-
-      setTranscripts((items) => {
-        if (items.some((item) => item.id === ragCallId)) return items;
-        return capTranscriptItems([
-          ...items,
-          {
-            id: ragCallId,
-            role: 'RagCall',
-            text: JSON.stringify(payload),
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-          }
-        ]);
-      });
+      return;
     }, [addTranscript, commitClientLatency, upsertToolCall]),
   );
 
@@ -871,7 +856,7 @@ function VoiceApp({ onResetClient }) {
 
       {location.pathname === '/calls' ? <CallsPage /> : location.pathname.startsWith('/calls/') ? (
         <CallDetailPage callId={location.pathname.split('/')[2]} />
-      ) : location.pathname === '/files' ? <FilesPage /> : location.pathname === '/memories' ? <MemoriesPage /> : (
+      ) : location.pathname === '/memories' ? <MemoriesPage /> : (
       <div className="main-stage page-stage">
         <div className="main-header">
           <div>

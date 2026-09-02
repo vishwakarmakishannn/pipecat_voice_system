@@ -43,7 +43,7 @@ from core.assistant_output import (
     contains_reserved_tool_markup,
     is_memory_safe_assistant_text,
 )
-from core.models import Call, MemoryChunk, TranscriptEntry, RagFile, User, UserMemory
+from core.models import Call, MemoryChunk, TranscriptEntry, User, UserMemory
 from core.prompt_config import load_memory_prompt
 
 
@@ -139,7 +139,6 @@ class MemoryBundle:
     facts: list[UserMemory]
     prior_call: Call | None = None
     prior_recent_transcripts: list[TranscriptEntry] | None = None
-    has_ready_rag_corpus: bool = False
 
 
 def normalize_runner_body(body: Any) -> dict[str, Any]:
@@ -261,21 +260,12 @@ async def load_session_bundle(body: Any) -> MemoryBundle | None:
         await db.commit()
         await db.refresh(call)
 
-        user_id = user.id
-        ready_rag_result = await db.execute(
-            select(RagFile.id)
-            .where(RagFile.user_id == user_id, RagFile.status == "ready")
-            .limit(1)
-        )
-        has_ready_rag_corpus = ready_rag_result.scalar_one_or_none() is not None
-
     return MemoryBundle(
         user=user,
         call=call,
         facts=[],
         prior_call=None,
         prior_recent_transcripts=None,
-        has_ready_rag_corpus=has_ready_rag_corpus,
     )
 
 
@@ -291,7 +281,6 @@ async def hydrate_memory_bundle(
         facts=facts,
         prior_call=None,
         prior_recent_transcripts=None,
-        has_ready_rag_corpus=bundle.has_ready_rag_corpus,
     )
 
 

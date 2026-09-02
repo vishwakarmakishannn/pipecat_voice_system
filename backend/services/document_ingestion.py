@@ -7,6 +7,7 @@ any particular source layout.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -199,6 +200,44 @@ def _table_markdown(table: Any, base_url: str) -> str:
     return "\n".join(rendered)
 
 
+def _table_record_blocks(block: DocumentBlock) -> list[DocumentBlock]:
+    """Turn a Markdown table into schema-preserving row records for retrieval."""
+    rows = []
+    for line in block.text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [_space(cell) for cell in line.strip().strip("|").split("|")]
+        if cells and not all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            rows.append(cells)
+    if len(rows) < 2:
+        return []
+    headers = rows[0]
+    records = []
+    for row_index, row in enumerate(rows[1:], start=1):
+        padded = row + [""] * max(0, len(headers) - len(row))
+        values = [
+            f"{header}: {value}"
+            for header, value in zip(headers, padded, strict=False)
+            if header and value
+        ]
+        if not values:
+            continue
+        records.append(
+            DocumentBlock(
+                kind="paragraph",
+                text="; ".join(values),
+                order=block.order,
+                metadata={
+                    **block.metadata,
+                    "structured_type": "table_record",
+                    "table_headers": headers,
+                    "table_row_index": row_index,
+                },
+            )
+        )
+    return records
+
+
 def _metadata_from_soup(soup: Any, source_url: str) -> tuple[str | None, str | None]:
     def meta_value(*selectors: tuple[str, str]) -> str | None:
         for attribute, value in selectors:
@@ -339,6 +378,211 @@ def canonical_document_from_html(
         extractor=extractor,
     )
     return document, SourceSignals(visible_text, headings, numeric_anchors)
+
+
+def canonical_document_from_trafilatura(
+    html: str,
+    source_url: str,
+    *,
+    title: str | None = None,
+    site_name: str | None = None,
+) -> CanonicalDocument | None:
+    """Build a main-content candidate without making it the default by fiat."""
+    try:
+        import trafilatura
+
+        markdown = trafilatura.extract(
+            html or "",
+            url=source_url,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            favor_precision=True,
+        )
+    except Exception:
+        return None
+    if not markdown or not markdown.strip():
+        return None
+    return canonical_document_from_markdown(
+        markdown,
+        source_url,
+        title=title,
+        site_name=site_name,
+        extractor="trafilatura_markdown_v1",
+    )
+
+
+def _json_ld_nodes(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, list):
+        for item in value:
+            yield from _json_ld_nodes(item)
+    elif isinstance(value, dict):
+        yield value
+        graph = value.get("@graph")
+        if graph is not None:
+            yield from _json_ld_nodes(graph)
+
+
+def canonical_document_from_structured_html(
+    html: str,
+    source_url: str,
+) -> CanonicalDocument | None:
+    """Extract JSON-LD and accessibility-linked FAQ records as atomic sections."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    title, site_name = _metadata_from_soup(soup, source_url)
+    records: list[tuple[str, str, dict[str, Any]]] = []
+
+    for script_index, script in enumerate(
+        soup.find_all("script", attrs={"type": "application/ld+json"})
+    ):
+        try:
+            payload = json.loads(script.string or script.get_text() or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for node_index, node in enumerate(_json_ld_nodes(payload)):
+            raw_types = node.get("@type", [])
+            types = {raw_types} if isinstance(raw_types, str) else set(raw_types or [])
+            if "FAQPage" in types:
+                for entity_index, entity in enumerate(node.get("mainEntity") or []):
+                    if not isinstance(entity, dict):
+                        continue
+                    question = _space(str(entity.get("name") or ""))
+                    accepted = entity.get("acceptedAnswer") or {}
+                    answer = _space(str(accepted.get("text") or "")) if isinstance(accepted, dict) else ""
+                    if question and answer:
+                        records.append((
+                            question,
+                            answer,
+                            {
+                                "structured_type": "faq",
+                                "source_kind": "json_ld",
+                                "source_index": [script_index, node_index, entity_index],
+                            },
+                        ))
+            elif "HowTo" in types:
+                name = _space(str(node.get("name") or ""))
+                steps = []
+                for step in node.get("step") or []:
+                    if isinstance(step, dict):
+                        value = _space(str(step.get("text") or step.get("name") or ""))
+                    else:
+                        value = _space(str(step))
+                    if value:
+                        steps.append(value)
+                if name and steps:
+                    records.append((
+                        name,
+                        "\n".join(f"- {step}" for step in steps),
+                        {
+                            "structured_type": "procedure",
+                            "source_kind": "json_ld",
+                            "source_index": [script_index, node_index],
+                        },
+                    ))
+
+    for control_index, control in enumerate(
+        soup.select("details > summary, [aria-controls], [data-bs-target], [data-target]")
+    ):
+        question = _space(control.get_text(" ", strip=True))
+        answer_node = None
+        source_reference = None
+        if control.name == "summary" and control.parent is not None:
+            answer_node = control.parent
+            source_reference = f"details:{control_index}"
+        else:
+            reference = (
+                control.get("aria-controls")
+                or control.get("data-bs-target")
+                or control.get("data-target")
+                or ""
+            )
+            reference = str(reference).lstrip("#")
+            if reference:
+                answer_node = soup.find(id=reference)
+                source_reference = f"id:{reference}"
+        if not question or answer_node is None:
+            continue
+        answer = _space(answer_node.get_text(" ", strip=True))
+        if control.name == "summary" and answer.startswith(question):
+            answer = answer[len(question) :].strip()
+        if answer and answer.casefold() != question.casefold():
+            records.append((
+                question,
+                answer,
+                {
+                    "structured_type": "faq",
+                    "source_kind": "accessible_relation",
+                    "source_reference": source_reference,
+                },
+            ))
+
+    deduplicated: list[tuple[str, str, dict[str, Any]]] = []
+    seen: set[tuple[str, str]] = set()
+    for question, answer, metadata in records:
+        fingerprint = (_plain(question).casefold(), _plain(answer).casefold())
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        deduplicated.append((question, answer, metadata))
+    if not deduplicated:
+        return None
+
+    blocks: list[DocumentBlock] = []
+    for question, answer, metadata in deduplicated:
+        blocks.append(
+            DocumentBlock(
+                "heading",
+                question,
+                len(blocks),
+                heading_level=2,
+                metadata=dict(metadata),
+            )
+        )
+        blocks.append(
+            DocumentBlock(
+                "paragraph",
+                answer,
+                len(blocks),
+                metadata=dict(metadata),
+            )
+        )
+    return CanonicalDocument(
+        source_url=source_url,
+        title=title,
+        site_name=site_name,
+        blocks=tuple(blocks),
+        extractor="structured_html_v1",
+    )
+
+
+def merge_structured_document(
+    primary: CanonicalDocument,
+    structured: CanonicalDocument | None,
+) -> CanonicalDocument:
+    """Prefer atomic records and suppress broad blocks that duplicate several of them."""
+    if structured is None or not structured.blocks:
+        return primary
+    answers = [
+        _plain(block.text).casefold()
+        for block in structured.blocks
+        if block.kind != "heading" and len(_plain(block.text)) >= 20
+    ]
+    retained = []
+    for block in primary.blocks:
+        normalized = _plain(block.text).casefold()
+        duplicate_count = sum(answer in normalized for answer in answers)
+        exact_duplicate = normalized in set(answers)
+        if block.kind != "heading" and (exact_duplicate or duplicate_count >= 2):
+            continue
+        retained.append(block)
+    combined = _deduplicate_blocks([*retained, *structured.blocks])
+    return replace(
+        primary,
+        blocks=tuple(combined),
+        extractor=f"{primary.extractor}+{structured.extractor}",
+    )
 
 
 def canonical_document_from_markdown(
@@ -569,6 +813,11 @@ def chunk_canonical_document(
                 clean,
             ]
             retrieval_text = "\n".join(part for part in retrieval_parts if part)
+            source_records = [
+                dict(block.metadata)
+                for block in section_blocks
+                if block_start <= block.order <= block_end and block.metadata
+            ]
             chunks.append(
                 DocumentChunk(
                     content=clean,
@@ -582,6 +831,7 @@ def chunk_canonical_document(
                         "quality_score": document.quality_score,
                         "link_count": len(re.findall(r"\[[^\]]+\]\([^)]*\)", content)),
                         "plain_chars": len(_plain(content)),
+                        "source_records": source_records,
                     },
                 )
             )
@@ -596,6 +846,15 @@ def chunk_canonical_document(
                 heading_stack.append("")
             heading_stack.append(_plain(block.text))
             section_heading_path = tuple(bit for bit in heading_stack if bit)
+        elif block.kind == "table":
+            records = _table_record_blocks(block)
+            if records:
+                flush()
+                for record in records:
+                    section_blocks = [record]
+                    flush()
+            else:
+                section_blocks.append(block)
         else:
             section_blocks.append(block)
     flush()

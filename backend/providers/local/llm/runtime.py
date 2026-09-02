@@ -11,10 +11,7 @@ from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 import httpx
 
 from core.prompt_config import load_system_prompt
-from tools.datetime_tool import openai_datetime_tool_schema
-from tools.rag import openai_rag_tool_schema
-from tools.raise_issue import openai_manage_issue_tool_schema
-from tools.tavily import openai_tavily_tool_schema
+from tools.registry import configured_openai_tool_schemas
 
 from .config import LocalLLMConfig, load_local_llm_config
 
@@ -121,12 +118,7 @@ class LocalLLMRuntime:
                         stream=False,
                         temperature=0.0,
                         max_tokens=4,
-                        tools=[
-                            openai_datetime_tool_schema(),
-                            openai_rag_tool_schema(),
-                            openai_tavily_tool_schema(),
-                            openai_manage_issue_tool_schema(),
-                        ],
+                        tools=configured_openai_tool_schemas(),
                         tool_choice="auto",
                         extra_body={
                             **self.config.extra_body,

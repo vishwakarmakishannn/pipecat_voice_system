@@ -44,3 +44,12 @@ def test_unsafe_empty_domain_allowlist_is_rejected():
     result = _import_config(MSWIPE_KNOWLEDGE_ALLOWED_DOMAINS="")
     assert result.returncode != 0
     assert "must not be empty" in result.stderr
+
+
+def test_embedding_query_timeout_cannot_exceed_voice_tool_deadline():
+    result = _import_config(
+        MSWIPE_KNOWLEDGE_TOOL_TIMEOUT_SECONDS="0.5",
+        MSWIPE_KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_SECONDS="0.6",
+    )
+    assert result.returncode != 0
+    assert "EMBEDDING_QUERY_TIMEOUT_SECONDS" in result.stderr

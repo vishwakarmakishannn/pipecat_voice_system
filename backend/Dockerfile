@@ -25,11 +25,11 @@ COPY . .
 # Install the actual project using uv
 RUN uv sync --frozen --no-dev
 
-FROM builder AS rag-builder
+FROM builder AS knowledge-builder
 
 # Document parsing/browser packages (and their OpenCV/FFmpeg bindings) exist
 # only in the ingestion image, never in the latency-sensitive voice image.
-RUN uv sync --frozen --no-dev --extra rag-worker
+RUN uv sync --frozen --no-dev --extra knowledge-worker
 
 FROM python:3.14-slim AS runtime-base
 
@@ -48,11 +48,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Schema migration is an explicit deployment job (the Compose `migrate`
 # service), so application replicas can start concurrently without contending
 # on Alembic locks.
-FROM runtime-base AS rag-runtime
+FROM runtime-base AS knowledge-runtime
 
-COPY --from=rag-builder /app /app
+COPY --from=knowledge-builder /app /app
 
-CMD ["python", "rag_worker.py"]
+CMD ["python", "knowledge_worker.py"]
 
 FROM runtime-base AS runtime
 

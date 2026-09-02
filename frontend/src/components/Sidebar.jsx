@@ -1,11 +1,10 @@
-import { Activity, Brain, FileText, LogOut, PhoneCall, Plus } from 'lucide-react';
+import { Activity, Brain, LogOut, PhoneCall, Plus } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { summarizeLatencyCohorts, summarizeLiveLatency } from '../utils/liveLatency.js';
 
 const NAV_ITEMS = [
   { path: '/playground', label: 'Playground', icon: Activity },
   { path: '/calls', label: 'Calls', icon: PhoneCall },
-  { path: '/files', label: 'Files', icon: FileText },
   { path: '/memories', label: 'Memories', icon: Brain },
 ];
 

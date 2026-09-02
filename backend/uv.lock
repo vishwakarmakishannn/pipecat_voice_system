@@ -2668,7 +2668,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pipecat-rag-backend"
+name = "pipecat-mswipe-backend"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2701,7 +2701,7 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-rag-worker = [
+knowledge-worker = [
     { name = "beautifulsoup4" },
     { name = "crawl4ai" },
     { name = "docling" },
@@ -2720,9 +2720,9 @@ requires-dist = [
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "bcrypt" },
-    { name = "beautifulsoup4", marker = "extra == 'rag-worker'" },
-    { name = "crawl4ai", marker = "extra == 'rag-worker'" },
-    { name = "docling", marker = "extra == 'rag-worker'" },
+    { name = "beautifulsoup4", marker = "extra == 'knowledge-worker'" },
+    { name = "crawl4ai", marker = "extra == 'knowledge-worker'" },
+    { name = "docling", marker = "extra == 'knowledge-worker'" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "loguru" },
@@ -2741,10 +2741,10 @@ requires-dist = [
     { name = "tavily-python" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "trafilatura", marker = "extra == 'rag-worker'" },
+    { name = "trafilatura", marker = "extra == 'knowledge-worker'" },
     { name = "uvicorn" },
 ]
-provides-extras = ["rag-worker"]
+provides-extras = ["knowledge-worker"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

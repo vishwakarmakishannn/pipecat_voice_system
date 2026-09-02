@@ -39,8 +39,6 @@ class User(Base):
     calls = relationship("Call", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("UserMemory", back_populates="user", cascade="all, delete-orphan")
     memory_chunks = relationship("MemoryChunk", back_populates="user", cascade="all, delete-orphan")
-    rag_files = relationship("RagFile", back_populates="user", cascade="all, delete-orphan")
-    rag_chunks = relationship("RagChunk", back_populates="user", cascade="all, delete-orphan")
 
 TERMINAL_CALL_STATUSES = ("completed", "failed", "cancelled", "abandoned")
 
@@ -320,68 +318,6 @@ class MemoryChunk(Base):
 
     user = relationship("User", back_populates="memory_chunks")
     call = relationship("Call", back_populates="memory_chunks")
-
-
-class RagFile(Base):
-    __tablename__ = "rag_files"
-    __table_args__ = (Index("idx_rag_files_user_status", "user_id", "status"),)
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    filename = Column(String, nullable=False)
-    storage_path = Column(Text, nullable=False)
-    mime_type = Column(String, nullable=False, default="application/pdf")
-    source_type = Column(String, nullable=False, default="pdf")
-    url = Column(Text, nullable=True)
-    final_url = Column(Text, nullable=True)
-    title = Column(Text, nullable=True)
-    site_name = Column(Text, nullable=True)
-    content_hash = Column(String, nullable=True)
-    ingestion_version = Column(String(32), nullable=False, default="structured-v2")
-    extractor = Column(String(64), nullable=True)
-    quality_score = Column(Float, nullable=True)
-    ingestion_warnings = Column(JSON, nullable=False, default=list)
-    size_bytes = Column(Integer, nullable=False, default=0)
-    status = Column(String, nullable=False, default="queued")
-    error = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-
-    user = relationship("User", back_populates="rag_files")
-    chunks = relationship("RagChunk", back_populates="file", cascade="all, delete-orphan")
-
-
-class RagChunk(Base):
-    __tablename__ = "rag_chunks"
-    __table_args__ = (
-        UniqueConstraint("file_id", "chunk_index", name="uq_rag_chunk_file_index"),
-        Index("idx_rag_chunks_user_file", "user_id", "file_id"),
-        Index("idx_rag_chunks_search_vector", "search_vector", postgresql_using="gin"),
-        Index(
-            "idx_rag_chunks_embedding",
-            "embedding",
-            postgresql_using="hnsw",
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-        ),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    file_id = Column(Integer, ForeignKey("rag_files.id"), nullable=False, index=True)
-    chunk_index = Column(Integer, nullable=False)
-    page_start = Column(Integer, nullable=True)
-    page_end = Column(Integer, nullable=True)
-    heading_path = Column(Text, nullable=True)
-    content = Column(Text, nullable=False)
-    token_count = Column(Integer, nullable=False, default=0)
-    metadata_json = Column(JSON, nullable=False, default=dict)
-    embedding = Column(Vector(MEMORY_EMBEDDING_DIMENSION), nullable=True)
-    search_vector = Column(TSVECTOR, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-
-    user = relationship("User", back_populates="rag_chunks")
-    file = relationship("RagFile", back_populates="chunks")
 
 
 KNOWLEDGE_UNIT_TYPES = (

@@ -1,0 +1,12 @@
+title = "Mswipe voice assistant secret scanning"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Safe configuration templates and generated dependency metadata"
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)uv\.lock$''',
+  '''(^|/)package-lock\.json$'''
+]

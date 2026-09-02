@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pipecat-rag-backend"
+name = "pipecat-mswipe-backend"
 version = "0.1.0"
-description = "Pipecat RAG Voice Agent Backend"
+description = "Pipecat Mswipe Voice Agent Backend"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -38,7 +38,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-rag-worker = [
+knowledge-worker = [
     "beautifulsoup4",
     "docling",
     "crawl4ai",

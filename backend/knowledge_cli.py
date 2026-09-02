@@ -9,6 +9,8 @@ import hashlib
 import json
 import re
 from collections import Counter
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 from uuid import UUID
 
 from sqlalchemy import func
@@ -20,6 +22,7 @@ from core.models import (
     KnowledgeEmbedding,
     KnowledgeJob,
     KnowledgeRelease,
+    KnowledgeReleaseUnit,
     KnowledgeSnapshot,
     KnowledgeSource,
     KnowledgeUnit,
@@ -33,6 +36,7 @@ from services.knowledge.releases import (
     rollback_release,
     validate_release,
 )
+from services.knowledge.retrieval import retrieve_knowledge
 from services.knowledge.taxonomy import import_ticket_taxonomy
 from services.knowledge.units import approve_unit, retire_unit
 
@@ -51,7 +55,12 @@ def parser() -> argparse.ArgumentParser:
     crawl = commands.add_parser("crawl", help="enqueue a website crawl")
     crawl.add_argument("source_id", type=UUID)
 
-    commands.add_parser("embed", help="enqueue embeddings for all draft/approved units")
+    embed = commands.add_parser("embed", help="enqueue knowledge embeddings")
+    embed.add_argument(
+        "--release-id",
+        type=UUID,
+        help="embed only the exact units in one release (recommended)",
+    )
     commands.add_parser("conflicts-detect", help="enqueue contradiction detection")
     commands.add_parser("aliases-seed", help="seed conservative Mswipe/STT aliases")
 
@@ -70,6 +79,10 @@ def parser() -> argparse.ArgumentParser:
 
     approve = commands.add_parser("unit-approve", help="approve one reviewed unit")
     approve.add_argument("unit_id", type=UUID)
+    approve.add_argument("--voice-answer")
+    approve.add_argument("--atomic-answer", action="store_true")
+    approve.add_argument("--answerability-reviewed", action="store_true")
+    approve.add_argument("--notes")
 
     retire = commands.add_parser("unit-retire", help="reject or retire one unit")
     retire.add_argument("unit_id", type=UUID)
@@ -90,12 +103,41 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="show release state")
     commands.add_parser("jobs", help="show the most recent control-plane jobs")
     commands.add_parser("corpus-audit", help="summarize corpus quality and review state")
+
+    demo = commands.add_parser(
+        "demo-prepare",
+        help="create a clearly labelled, non-production public-site demo release",
+    )
+    demo.add_argument("version")
+    demo.add_argument("--source-id", required=True, type=UUID)
+
+    search = commands.add_parser("search", help="test the currently published release")
+    search.add_argument("query")
+    search.add_argument("--top-k", type=int, default=4)
     return root
 
 
 def _answer_fingerprint(answer: str) -> str:
     normalized = re.sub(r"\s+", " ", answer).strip().casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+_DEMO_PATH_PREFIXES = (
+    "/contact-us",
+    "/in-store-solutions",
+    "/online-solutions",
+    "/support",
+    "/tracking-solutions",
+)
+
+
+def _is_demo_source_uri(uri: str) -> bool:
+    parsed = urlparse(uri)
+    path = parsed.path.rstrip("/") or "/"
+    return parsed.hostname in {"mswipe.com", "www.mswipe.com"} and any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in _DEMO_PATH_PREFIXES
+    )
 
 
 async def _corpus_audit(db) -> dict:
@@ -193,7 +235,18 @@ async def run(args: argparse.Namespace) -> None:
             job = await enqueue_knowledge_job(db, "crawl_source", source_id=args.source_id)
             print(json.dumps({"job_id": str(job.id), "status": job.status}))
         elif args.command == "embed":
-            job = await enqueue_knowledge_job(db, "embed_units")
+            payload = {}
+            if args.release_id:
+                result = await db.execute(
+                    select(KnowledgeReleaseUnit.unit_id).where(
+                        KnowledgeReleaseUnit.release_id == args.release_id
+                    )
+                )
+                unit_ids = list(result.scalars().all())
+                if not unit_ids:
+                    raise ValueError("Release not found or contains no units")
+                payload["unit_ids"] = [str(unit_id) for unit_id in unit_ids]
+            job = await enqueue_knowledge_job(db, "embed_units", payload=payload)
             print(json.dumps({"job_id": str(job.id), "status": job.status}))
         elif args.command == "aliases-seed":
             inserted = await seed_default_aliases(db)
@@ -255,8 +308,22 @@ async def run(args: argparse.Namespace) -> None:
                 "review_notes": item.review_notes,
             }, indent=2))
         elif args.command == "unit-approve":
-            unit = await approve_unit(db, args.unit_id)
-            print(json.dumps({"id": str(unit.id), "status": unit.status}))
+            unit = await approve_unit(
+                db,
+                args.unit_id,
+                voice_answer=args.voice_answer,
+                atomic_answer=True if args.atomic_answer else None,
+                answerability_reviewed=(
+                    True if args.answerability_reviewed else None
+                ),
+                review_notes=args.notes,
+            )
+            print(json.dumps({
+                "id": str(unit.id),
+                "status": unit.status,
+                "metadata": unit.metadata_json,
+                "voice_answer": unit.voice_answer,
+            }))
         elif args.command == "unit-retire":
             unit = await retire_unit(db, args.unit_id, review_notes=args.notes)
             print(json.dumps({"id": str(unit.id), "status": unit.status}))
@@ -316,6 +383,87 @@ async def run(args: argparse.Namespace) -> None:
             ], indent=2))
         elif args.command == "corpus-audit":
             print(json.dumps(await _corpus_audit(db), indent=2))
+        elif args.command == "demo-prepare":
+            existing = await db.execute(
+                select(KnowledgeRelease).where(KnowledgeRelease.version == args.version)
+            )
+            release = existing.scalars().first()
+            if release is not None:
+                print(json.dumps({
+                    "release_id": str(release.id),
+                    "version": release.version,
+                    "status": release.status,
+                    "units": release.unit_count,
+                    "existing": True,
+                }, indent=2))
+                return
+            result = await db.execute(
+                select(KnowledgeUnit)
+                .join(KnowledgeDocument, KnowledgeUnit.document_id == KnowledgeDocument.id)
+                .join(KnowledgeSnapshot, KnowledgeDocument.snapshot_id == KnowledgeSnapshot.id)
+                .where(
+                    KnowledgeSnapshot.source_id == args.source_id,
+                    KnowledgeUnit.status.in_(("draft", "approved")),
+                )
+                .order_by(KnowledgeUnit.stable_key)
+            )
+            units = [
+                unit for unit in result.scalars().all()
+                if _is_demo_source_uri(unit.source_uri)
+            ]
+            if not units:
+                raise ValueError("No eligible demo units found for this source")
+            now = datetime.now(timezone.utc)
+            for unit in units:
+                if unit.status == "draft":
+                    unit.status = "approved"
+                    unit.approved_at = now
+                    unit.review_notes = (
+                        "DEMO ONLY: auto-selected from the public Mswipe website; "
+                        "not reviewed for production use"
+                    )
+            release = await create_release(
+                db,
+                version=args.version,
+                unit_ids=[unit.id for unit in units],
+                description=(
+                    "DEMO ONLY: narrow public product/support/contact corpus; "
+                    "not approved for production customer support"
+                ),
+            )
+            print(json.dumps({
+                "release_id": str(release.id),
+                "version": release.version,
+                "status": release.status,
+                "units": release.unit_count,
+                "existing": False,
+                "warning": "DEMO ONLY - not production reviewed",
+            }, indent=2))
+        elif args.command == "search":
+            response = await retrieve_knowledge(
+                args.query,
+                db=db,
+                top_k=max(1, min(args.top_k, 10)),
+            )
+            print(json.dumps({
+                "status": response.status,
+                "route": response.route.name,
+                "reason": response.reason,
+                "release": response.release_version,
+                "confidence": response.confidence,
+                "normalized_query": response.normalized_query,
+                "hits": [
+                    {
+                        "stable_key": hit.stable_key,
+                        "title": hit.title,
+                        "answer": hit.voice_answer or hit.answer,
+                        "source": hit.source_uri,
+                        "score": hit.score,
+                        "matched_by": hit.matched_by,
+                    }
+                    for hit in response.hits
+                ],
+            }, indent=2))
 
 
 async def main() -> None:

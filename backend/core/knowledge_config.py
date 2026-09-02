@@ -1,8 +1,7 @@
 """Validated configuration for the production Mswipe knowledge system.
 
-The knowledge subsystem is intentionally configured independently from the
-legacy, per-user RAG implementation.  It is disabled by default so a migrated
-database cannot change live call behaviour until an approved release exists.
+The knowledge subsystem is disabled by default so a migrated database cannot
+change live call behaviour until an approved release exists.
 """
 
 import os
@@ -76,8 +75,27 @@ KNOWLEDGE_TEXT_CANDIDATES = _int_env("MSWIPE_KNOWLEDGE_TEXT_CANDIDATES", 30)
 KNOWLEDGE_VECTOR_CANDIDATES = _int_env("MSWIPE_KNOWLEDGE_VECTOR_CANDIDATES", 30)
 KNOWLEDGE_RRF_K = _int_env("MSWIPE_KNOWLEDGE_RRF_K", 60)
 KNOWLEDGE_MIN_CONFIDENCE = _float_env("MSWIPE_KNOWLEDGE_MIN_CONFIDENCE", 0.42)
-KNOWLEDGE_VOICE_TIMEOUT_SECONDS = _float_env(
-    "MSWIPE_KNOWLEDGE_VOICE_TIMEOUT_SECONDS", 0.8
+KNOWLEDGE_TOOL_TIMEOUT_SECONDS = _float_env(
+    "MSWIPE_KNOWLEDGE_TOOL_TIMEOUT_SECONDS", 1.5
+)
+KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_SECONDS = _float_env(
+    "MSWIPE_KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_SECONDS", 0.6
+)
+KNOWLEDGE_TOOL_TOP_K = _int_env("MSWIPE_KNOWLEDGE_TOOL_TOP_K", 2)
+KNOWLEDGE_QUERY_CACHE_SIZE = _int_env(
+    "MSWIPE_KNOWLEDGE_QUERY_CACHE_SIZE", 256
+)
+KNOWLEDGE_QUERY_CACHE_TTL_SECONDS = _float_env(
+    "MSWIPE_KNOWLEDGE_QUERY_CACHE_TTL_SECONDS", 600.0
+)
+KNOWLEDGE_QUERY_INFLIGHT_MAX = _int_env(
+    "MSWIPE_KNOWLEDGE_QUERY_INFLIGHT_MAX", 128
+)
+KNOWLEDGE_EMBEDDING_CIRCUIT_FAILURES = _int_env(
+    "MSWIPE_KNOWLEDGE_EMBEDDING_CIRCUIT_FAILURES", 2
+)
+KNOWLEDGE_EMBEDDING_CIRCUIT_COOLDOWN_SECONDS = _float_env(
+    "MSWIPE_KNOWLEDGE_EMBEDDING_CIRCUIT_COOLDOWN_SECONDS", 30.0
 )
 KNOWLEDGE_VOICE_CONTEXT_MAX_CHARS = _int_env(
     "MSWIPE_KNOWLEDGE_VOICE_CONTEXT_MAX_CHARS", 2400
@@ -122,8 +140,33 @@ if not 1 <= KNOWLEDGE_TOP_K <= 10:
     raise ValueError("MSWIPE_KNOWLEDGE_TOP_K must be between 1 and 10")
 if not 0 <= KNOWLEDGE_MIN_CONFIDENCE <= 1:
     raise ValueError("MSWIPE_KNOWLEDGE_MIN_CONFIDENCE must be between 0 and 1")
-if not 0.1 <= KNOWLEDGE_VOICE_TIMEOUT_SECONDS <= 3:
-    raise ValueError("MSWIPE_KNOWLEDGE_VOICE_TIMEOUT_SECONDS must be between 0.1 and 3")
+if not 0.25 <= KNOWLEDGE_TOOL_TIMEOUT_SECONDS <= 5:
+    raise ValueError("MSWIPE_KNOWLEDGE_TOOL_TIMEOUT_SECONDS must be between 0.25 and 5")
+if not 0.1 <= KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_SECONDS <= KNOWLEDGE_TOOL_TIMEOUT_SECONDS:
+    raise ValueError(
+        "MSWIPE_KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_SECONDS must be between 0.1 "
+        "and MSWIPE_KNOWLEDGE_TOOL_TIMEOUT_SECONDS"
+    )
+if not 1 <= KNOWLEDGE_TOOL_TOP_K <= KNOWLEDGE_TOP_K:
+    raise ValueError(
+        "MSWIPE_KNOWLEDGE_TOOL_TOP_K must be between 1 and MSWIPE_KNOWLEDGE_TOP_K"
+    )
+if not 0 <= KNOWLEDGE_QUERY_CACHE_SIZE <= 10_000:
+    raise ValueError("MSWIPE_KNOWLEDGE_QUERY_CACHE_SIZE must be between 0 and 10000")
+if not 0 <= KNOWLEDGE_QUERY_CACHE_TTL_SECONDS <= 86_400:
+    raise ValueError(
+        "MSWIPE_KNOWLEDGE_QUERY_CACHE_TTL_SECONDS must be between 0 and 86400"
+    )
+if not 1 <= KNOWLEDGE_QUERY_INFLIGHT_MAX <= 10_000:
+    raise ValueError("MSWIPE_KNOWLEDGE_QUERY_INFLIGHT_MAX must be between 1 and 10000")
+if not 1 <= KNOWLEDGE_EMBEDDING_CIRCUIT_FAILURES <= 20:
+    raise ValueError(
+        "MSWIPE_KNOWLEDGE_EMBEDDING_CIRCUIT_FAILURES must be between 1 and 20"
+    )
+if not 0.1 <= KNOWLEDGE_EMBEDDING_CIRCUIT_COOLDOWN_SECONDS <= 3600:
+    raise ValueError(
+        "MSWIPE_KNOWLEDGE_EMBEDDING_CIRCUIT_COOLDOWN_SECONDS must be between 0.1 and 3600"
+    )
 if KNOWLEDGE_EMBEDDING_DIMENSION != 768:
     raise ValueError(
         "MSWIPE_KNOWLEDGE_EMBEDDING_DIMENSION must remain 768 for schema v1; "

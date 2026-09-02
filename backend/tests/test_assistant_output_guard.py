@@ -6,7 +6,6 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
-    OutputTransportMessageUrgentFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 
@@ -22,7 +21,7 @@ class DiagnosticRecorder:
 
 
 @pytest.mark.anyio
-async def test_normal_assistant_text_streams_as_sanitized_deltas(monkeypatch):
+async def test_normal_assistant_text_streams_to_the_normalization_stage(monkeypatch):
     frames = []
     processor = AssistantOutputGuardProcessor()
 
@@ -36,23 +35,7 @@ async def test_normal_assistant_text_streams_as_sanitized_deltas(monkeypatch):
     await processor.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
 
     text = "".join(frame.text for frame in frames if isinstance(frame, LLMTextFrame))
-    messages = [
-        frame.message["data"]["payload"]
-        for frame in frames
-        if isinstance(frame, OutputTransportMessageUrgentFrame)
-    ]
     assert text == "Hello there."
-    deltas = [message for message in messages if message["delta"]]
-    final = [message for message in messages if not message["delta"]]
-    assert "".join(message["text"] for message in deltas) == "Hello there."
-    assert len({message["id"] for message in messages}) == 1
-    assert final == [{
-        "id": messages[0]["id"],
-        "text": "Hello there.",
-        "source": "llm",
-        "delta": False,
-        "final": True,
-    }]
 
 
 @pytest.mark.anyio

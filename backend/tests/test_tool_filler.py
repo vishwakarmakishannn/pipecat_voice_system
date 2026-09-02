@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from pipecat.frames.frames import FunctionCallInProgressFrame, FunctionCallResultFrame, OutputTransportMessageUrgentFrame, TTSSpeakFrame
@@ -50,13 +51,20 @@ async def test_slow_tool_gets_one_delayed_filler(monkeypatch):
     transcript_frames = [frame for frame in frames if isinstance(frame, OutputTransportMessageUrgentFrame)]
     assert any(
         frame.message["data"]["type"] == "assistant_transcript"
-        and frame.message["data"]["payload"]["text"] == "Let me check that."
+        and frame.message["data"]["payload"]["text"] == "Let me look that up for you."
         for frame in transcript_frames
     )
 
 
 @pytest.mark.anyio
-async def test_immediate_filler_precedes_tool_transcription(monkeypatch):
+@pytest.mark.parametrize(
+    "function_name",
+    ["search_mswipe_knowledge", "manage_issue_draft", "get_current_datetime"],
+)
+async def test_immediate_filler_precedes_tool_transcription(
+    monkeypatch,
+    function_name,
+):
     frames = []
     processor = ToolFillerProcessor(
         latency_state=TurnLatencyState(session_id="test"),
@@ -69,12 +77,13 @@ async def test_immediate_filler_precedes_tool_transcription(monkeypatch):
 
     monkeypatch.setattr(processor, "push_frame", capture)
     await processor.process_frame(
-        FunctionCallInProgressFrame("search", "ordered-call", {}),
+        FunctionCallInProgressFrame(function_name, "ordered-call", {}),
         FrameDirection.DOWNSTREAM,
     )
 
     assert isinstance(frames[0], OutputTransportMessageUrgentFrame)
     assert frames[0].message["data"]["type"] == "assistant_transcript"
+    assert frames[0].message["data"]["payload"]["text"] == "Let me look that up for you."
     assert isinstance(frames[1], TTSSpeakFrame)
     assert frames[2].message["data"]["type"] == "tool_call"
 
@@ -163,6 +172,50 @@ async def test_timeout_lifecycle_is_sent_to_ui_as_completed_with_result(monkeypa
     ]
     assert [message["status"] for message in messages] == ["in_progress", "completed"]
     assert messages[-1]["result"] == timeout_result
+
+
+@pytest.mark.anyio
+async def test_issue_tool_lifecycle_redacts_pii_before_browser_event(monkeypatch):
+    frames = []
+    processor = ToolFillerProcessor(delay_seconds=1, enabled=False)
+
+    async def capture(frame, _direction):
+        frames.append(frame)
+
+    monkeypatch.setattr(processor, "push_frame", capture)
+    arguments = {
+        "operation": "update",
+        "cust_id": "C123456",
+        "email": "rohan22@example.com",
+        "mobile": "9876543210",
+        "device_id": "MSW12345678",
+        "description": "Payments are not being announced",
+    }
+    result = {"status": "collecting_fields", "draft": arguments}
+    await processor.process_frame(
+        FunctionCallInProgressFrame("manage_issue_draft", "private-call", arguments),
+        FrameDirection.DOWNSTREAM,
+    )
+    await processor.process_frame(
+        FunctionCallResultFrame(
+            "manage_issue_draft",
+            "private-call",
+            arguments,
+            result,
+        ),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    browser_payload = json.dumps([
+        frame.message
+        for frame in frames
+        if isinstance(frame, OutputTransportMessageUrgentFrame)
+    ])
+    for raw_value in arguments.values():
+        if raw_value != "update":
+            assert raw_value not in browser_payload
+    assert "***3456" in browser_payload
+    assert "r***@example.com" in browser_payload
 
 
 @pytest.mark.anyio

@@ -4,8 +4,29 @@ import time
 from collections import deque
 from loguru import logger
 from deepgram.listen.v1.types.listen_v1keep_alive import ListenV1KeepAlive
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from core.audio_config import audio_input_sample_rate
+
+
+def _boolean_setting(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
+
+def deepgram_stt_settings() -> DeepgramSTTSettings:
+    """Build recorded, deployment-controlled formatting settings."""
+    return DeepgramSTTSettings(
+        model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3-general").strip(),
+        language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en").strip(),
+        numerals=_boolean_setting("DEEPGRAM_STT_NUMERALS", True),
+        smart_format=_boolean_setting("DEEPGRAM_STT_SMART_FORMAT", True),
+        interim_results=True,
+        punctuate=True,
+    )
 
 
 class ResilientDeepgramSTTService(DeepgramSTTService):
@@ -305,4 +326,5 @@ def get_deepgram_stt():
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         sample_rate=audio_input_sample_rate(),
         audio_passthrough=True,
+        settings=deepgram_stt_settings(),
     )

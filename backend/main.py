@@ -117,13 +117,6 @@ from services.recordings import (
     recover_unfinished_recordings,
 )
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
-from services.rag import (
-    build_rag_context_with_payload,
-    is_rag_query,
-    prime_rag_corpus_status,
-    user_has_ready_rag_corpus,
-)
-from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from core.voice_config import load_endpointing_config, startup_greeting
 from core.voice_services import initialize_voice_runtime
 from core.llm_config import timeout_recovery_text
@@ -148,14 +141,15 @@ from core.admission import current_voice_slot_id, voice_admission
 from core.latency_observer import PipelineLatencyObserver, event_loop_lag_monitor
 from core.realtime_gate import realtime_turn_gate
 from tools.tavily import tavily_search
+from tools.mswipe_knowledge import search_mswipe_knowledge
 from tools.raise_issue import IssueWorkflowState, manage_issue_draft
 from tools.datetime_tool import get_current_datetime
-from tools.rag import search_uploaded_content
+from tools.registry import configured_voice_tools
 
 from core.processors import (
     CallTimelineProcessor,
     ToolFillerProcessor,
-    ContextRetrievalProcessor,
+    MemoryRetrievalProcessor,
     LeadingSilenceTrimmerProcessor,
     TurnContextCleanupProcessor,
     TurnLatencyState,
@@ -163,13 +157,15 @@ from core.processors import (
     CallUsageMetricsProcessor,
     BoundedContextProcessor,
     AssistantOutputGuardProcessor,
+    SpeechNormalizationProcessor,
     immutable_context_messages,
     ToolRoutingProcessor,
     transport_server_message,
 )
 from core.task_queue import task_queue
 from core.knowledge_config import KNOWLEDGE_ENABLED
-from core.knowledge_processor import MswipeKnowledgeProcessor
+from core.tool_config import web_search_enabled
+from services.knowledge.embedding import warm_knowledge_embedding
 
 
 async def _cancel_explicit_call(worker: PipelineWorker) -> None:
@@ -266,8 +262,6 @@ async def _run_bot(
         )
     call_id = memory_bundle.call.id if memory_bundle else None
     user_id = memory_bundle.user.id if memory_bundle else None
-    if memory_bundle:
-        prime_rag_corpus_status(user_id, memory_bundle.has_ready_rag_corpus)
     context = LLMContext(
         messages=memory_messages,
         tools=[]
@@ -307,40 +301,27 @@ async def _run_bot(
             getattr(llm, "connection_warmed", False)
         ),
     )
-    context_retrieval = ContextRetrievalProcessor(
+    memory_retrieval = MemoryRetrievalProcessor(
         user_id,
         call_id,
         context,
         latency_state,
-        ready_corpus_check=user_has_ready_rag_corpus,
         mutation_epoch=mutation_epoch,
-        name="ContextRetrieval",
+        name="MemoryRetrieval",
     )
-    mswipe_knowledge = (
-        MswipeKnowledgeProcessor(
-            context,
-            latency_state=latency_state,
-            mutation_epoch=mutation_epoch,
-            name="MswipeKnowledge",
-        )
-        if KNOWLEDGE_ENABLED
-        else None
-    )
-    if hasattr(llm, "recovery_text_getter"):
-        llm.recovery_text_getter = context_retrieval.timeout_recovery_text
     issue_workflow = IssueWorkflowState()
     tool_router = ToolRoutingProcessor(
         context,
-        search_tool=tavily_search,
         issue_tool=manage_issue_draft,
+        knowledge_tool=search_mswipe_knowledge if KNOWLEDGE_ENABLED else None,
         datetime_tool=get_current_datetime,
-        document_tool=search_uploaded_content,
-        document_tool_available=context_retrieval.document_tool_available,
+        search_tool=tavily_search if web_search_enabled() else None,
         issue_workflow=issue_workflow,
+        latency_state=latency_state,
         name="ToolRouter",
     )
     context_cleanup = TurnContextCleanupProcessor(
-        context_retrieval, latency_state, name="TurnContextCleanup"
+        memory_retrieval, latency_state, name="TurnContextCleanup"
     )
     endpointing = load_endpointing_config()
     logger.info(
@@ -418,9 +399,7 @@ async def _run_bot(
     @user_aggregator.event_handler("on_user_turn_started")
     async def reset_query_scoped_turn_state(aggregator, strategy):
         latency_state.user_audio_offset_ms = audio_buffer.elapsed_ms
-        context_retrieval.start_user_turn()
-        if mswipe_knowledge:
-            mswipe_knowledge.start_user_turn()
+        memory_retrieval.start_user_turn()
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def persist_complete_user_turn(aggregator, strategy, message):
@@ -454,7 +433,6 @@ async def _run_bot(
 
     audio_offset_getter = lambda: audio_buffer.elapsed_ms
     latency_state.audio_offset_getter = audio_offset_getter
-    context_retrieval._audio_offset_getter = audio_offset_getter
     assistant_memory = CallTimelineProcessor(
         call_id,
         capture="assistant",
@@ -464,6 +442,7 @@ async def _run_bot(
         name="AssistantMemory",
     )
     assistant_output_guard = AssistantOutputGuardProcessor(name="AssistantOutputGuard")
+    speech_normalizer = SpeechNormalizationProcessor(name="SpeechNormalizer")
     tool_filler = ToolFillerProcessor(
         latency_state,
         call_id=call_id,
@@ -482,8 +461,7 @@ async def _run_bot(
             LatencyBoundaryProcessor(latency_state, "vad", name="PostVADLatency"),
             user_aggregator,
             LatencyBoundaryProcessor(latency_state, "turn", name="PostTurnLatency"),
-            *([mswipe_knowledge] if mswipe_knowledge else []),
-            context_retrieval,
+            memory_retrieval,
             tool_router,
             context_window,
             LatencyBoundaryProcessor(
@@ -491,6 +469,7 @@ async def _run_bot(
             ),
             llm,
             assistant_output_guard,
+            speech_normalizer,
             LatencyBoundaryProcessor(latency_state, "llm", name="PostLLMLatency"),
             context_cleanup,
             tool_filler,
@@ -524,7 +503,7 @@ async def _run_bot(
             "latency_state": latency_state,
             "call_id": call_id,
             "issue_workflow": issue_workflow,
-            "context_retrieval": context_retrieval,
+            "memory_retrieval": memory_retrieval,
         },
         observers=[PipelineLatencyObserver()],
     )
@@ -544,6 +523,7 @@ async def _run_bot(
     )
     tool_filler._diagnostic_recorder = diagnostic_recorder
     assistant_output_guard._diagnostic_recorder = diagnostic_recorder
+    speech_normalizer._diagnostic_recorder = diagnostic_recorder
     task_queue.register_rejection_handler(
         str(call_id), diagnostic_recorder.record_queue_rejection
     )
@@ -561,7 +541,7 @@ async def _run_bot(
             latency_state.mark_stage(f"llm_{phase}{suffix}")
 
         llm.phase_callback = record_llm_phase
-    context_retrieval._diagnostic_recorder = diagnostic_recorder
+    memory_retrieval._diagnostic_recorder = diagnostic_recorder
     if context_summary_llm and hasattr(context_summary_llm, "diagnostic_callback"):
         context_summary_llm.diagnostic_callback = diagnostic_recorder.record
 
@@ -603,13 +583,8 @@ async def _run_bot(
             },
             prompt_version=os.getenv("VOICE_PROMPT_VERSION", "voice-2.0"),
             prompt_hash=hashlib.sha256((session_instruction or "").encode()).hexdigest(),
-            tool_schema_hash=tool_schema_hash(
-                tavily_search,
-                search_uploaded_content,
-                manage_issue_draft,
-                get_current_datetime,
-            ),
-            rag_config_version=os.getenv("RAG_CONFIG_VERSION", "voice-2.0"),
+            tool_schema_hash=tool_schema_hash(*configured_voice_tools()),
+            rag_config_version=os.getenv("MSWIPE_KNOWLEDGE_RELEASE", "published"),
             application_version=os.getenv("APP_VERSION") or os.getenv("GIT_SHA") or "development",
         )
 
@@ -1073,7 +1048,6 @@ if __name__ == "__main__":
     from api.auth import router as auth_router
     from api.calls import router as calls_router
     from api.memories import router as memories_router
-    from api.rag_files import router as rag_files_router
     from api.knowledge import router as knowledge_router
     from api.telemetry import router as telemetry_router
     from api.transport import router as transport_router
@@ -1081,7 +1055,6 @@ if __name__ == "__main__":
     app.include_router(auth_router)
     app.include_router(calls_router)
     app.include_router(memories_router)
-    app.include_router(rag_files_router)
     app.include_router(knowledge_router)
     app.include_router(telemetry_router)
     app.include_router(transport_router)
@@ -1099,14 +1072,17 @@ if __name__ == "__main__":
         # sink here, after that override and before latency-critical work.
         configure_nonblocking_logging(force=True)
         try:
-            await asyncio.gather(
+            warmups = [
                 asyncio.to_thread(warm_smart_turn_model),
                 asyncio.to_thread(warm_silero_vad_model),
                 warm_voice_pool(int(os.getenv("DB_VOICE_WARM_CONNECTIONS", "2"))),
                 warm_stt_provider(),
                 warm_tts_provider(),
                 warm_llm_provider(),
-            )
+            ]
+            if KNOWLEDGE_ENABLED:
+                warmups.append(warm_knowledge_embedding())
+            await asyncio.gather(*warmups)
         except BaseException:
             await asyncio.gather(
                 shutdown_stt_provider(),

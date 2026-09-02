@@ -15,12 +15,15 @@ def _message(*, content="", tool=None, arguments="{}"):
 
 
 def test_model_gate_accepts_contextual_native_tool_query():
-    case = next(item for item in CASES if item.name == "correction_builds_contextual_query")
+    case = next(
+        item for item in CASES
+        if item.name == "mswipe_followup_builds_contextual_query"
+    )
     passed, result = evaluate_message(
         case,
         _message(
-            tool="tavily_search",
-            arguments='{"query":"Samsung Galaxy A30s camera specifications"}',
+            tool="search_mswipe_knowledge",
+            arguments='{"query":"How to install Mswipe Soundbox"}',
         ),
     )
 
@@ -29,11 +32,14 @@ def test_model_gate_accepts_contextual_native_tool_query():
 
 
 def test_model_gate_rejects_simulated_tool_markup():
-    case = next(item for item in CASES if item.name == "current_search")
+    case = next(item for item in CASES if item.name == "mswipe_product_knowledge")
     passed, result = evaluate_message(
         case,
         _message(
-            content='<function=tavily_search>{"query":"Dell G15 price"}</function>'
+            content=(
+                '<function=search_mswipe_knowledge>'
+                '{"query":"Mswipe Soundbox"}</function>'
+            )
         ),
     )
 

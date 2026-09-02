@@ -1,7 +1,6 @@
 import asyncio
 import os
 import aioboto3
-from loguru import logger
 import aiofiles
 import shutil
 import uuid
@@ -24,29 +23,6 @@ class StorageClient:
                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
                 region_name=S3_REGION,
             )
-
-    async def upload_file(self, data: bytes, object_name: str) -> str:
-        """Upload a file to an S3 bucket or local fallback"""
-        if self.use_s3:
-            try:
-                import io
-                async with self.session.client('s3', endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None) as s3:
-                    await s3.upload_fileobj(io.BytesIO(data), S3_BUCKET, object_name)
-                    if S3_ENDPOINT:
-                        return f"{S3_ENDPOINT}/{S3_BUCKET}/{object_name}"
-                    return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{object_name}"
-            except Exception as e:
-                logger.error(f"Failed to upload {object_name} to S3: {e}")
-                raise e
-        else:
-            # Fallback to local storage for dev
-            from pathlib import Path
-            from core.rag_config import RAG_UPLOAD_DIR
-            local_path = Path(RAG_UPLOAD_DIR) / object_name
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            async with aiofiles.open(local_path, 'wb') as f:
-                await f.write(data)
-            return f"local://{local_path}"
 
     async def upload_path(
         self,
@@ -72,31 +48,6 @@ class StorageClient:
         destination.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copyfile, source, destination)
         return object_name
-
-    async def upload_rag_path(
-        self,
-        source_path: str | Path,
-        object_name: str,
-        *,
-        content_type: str = "application/pdf",
-    ) -> str:
-        """Store a RAG artifact without loading it into the API process."""
-        source = Path(source_path)
-        if self.use_s3:
-            async with self.session.client(
-                "s3", endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None
-            ) as s3:
-                await s3.upload_file(
-                    str(source),
-                    S3_BUCKET,
-                    object_name,
-                    ExtraArgs={"ContentType": content_type},
-                )
-            return object_name
-        destination = self.local_rag_object_path(object_name)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(shutil.copyfile, source, destination)
-        return f"local://{destination}"
 
     async def upload_knowledge_bytes(
         self,
@@ -149,15 +100,6 @@ class StorageClient:
             raise ValueError("Invalid recording object key")
         return candidate
 
-    def local_rag_object_path(self, object_name: str) -> Path:
-        from core.rag_config import RAG_UPLOAD_DIR
-
-        root = Path(RAG_UPLOAD_DIR).expanduser().resolve()
-        candidate = (root / object_name).resolve()
-        if candidate != root and root not in candidate.parents:
-            raise ValueError("Invalid RAG object key")
-        return candidate
-
     def local_knowledge_object_path(self, object_name: str) -> Path:
         from core.knowledge_config import KNOWLEDGE_STORAGE_DIR
 
@@ -166,46 +108,6 @@ class StorageClient:
         if candidate != root and root not in candidate.parents:
             raise ValueError("Invalid knowledge object key")
         return candidate
-
-    async def download_file(self, object_name: str, local_path: str):
-        """Download a file from an S3 bucket or local fallback"""
-        if self.use_s3:
-            try:
-                async with self.session.client('s3', endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None) as s3:
-                    await s3.download_file(S3_BUCKET, object_name, local_path)
-            except Exception as e:
-                logger.error(f"Failed to download {object_name} from S3: {e}")
-                raise e
-        else:
-            # For local fallback, if the file is already there, we can just copy it if needed,
-            # but usually the path returned was the local path. We just copy it to local_path.
-            from pathlib import Path
-            import shutil
-            if object_name.startswith("local://"):
-                src = object_name.replace("local://", "")
-                shutil.copy2(src, local_path)
-            else:
-                from core.rag_config import RAG_UPLOAD_DIR
-                src = Path(RAG_UPLOAD_DIR) / object_name
-                shutil.copy2(src, local_path)
-
-    async def delete_file(self, object_name: str):
-        """Delete a file from an S3 bucket"""
-        if self.use_s3:
-            try:
-                async with self.session.client('s3', endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None) as s3:
-                    await s3.delete_object(Bucket=S3_BUCKET, Key=object_name)
-            except Exception as e:
-                logger.error(f"Failed to delete {object_name} from S3: {e}")
-                # Don't throw for deletion, just log
-        else:
-            if object_name.startswith("local://"):
-                src = object_name.replace("local://", "")
-                Path(src).unlink(missing_ok=True)
-            else:
-                from core.rag_config import RAG_UPLOAD_DIR
-                src = Path(RAG_UPLOAD_DIR) / object_name
-                Path(src).unlink(missing_ok=True)
 
     async def delete_file_strict(self, object_name: str) -> None:
         """Delete an object and surface failures so retention jobs can retry."""

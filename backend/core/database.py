@@ -15,6 +15,11 @@ if not DATABASE_URL:
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
+    # Docker, load balancers, and database failovers can leave an idle socket
+    # in the pool after the server side has already closed it. Validate every
+    # checkout so a dead connection is replaced before a call transaction
+    # starts.
+    pool_pre_ping=True,
     pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
     max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
     pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
@@ -22,7 +27,7 @@ engine = create_async_engine(
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-_voice_budget_ms = int(float(os.getenv("RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS", "4.2")) * 1000)
+_voice_budget_ms = int(float(os.getenv("VOICE_RETRIEVAL_BUDGET_SECONDS", "1.0")) * 1000)
 _voice_statement_timeout_ms = int(os.getenv("DB_VOICE_STATEMENT_TIMEOUT_MS", "750"))
 _voice_hnsw_iterative_scan = os.getenv("DB_VOICE_HNSW_ITERATIVE_SCAN", "relaxed_order").strip()
 if _voice_hnsw_iterative_scan not in {"off", "strict_order", "relaxed_order"}:
@@ -55,6 +60,7 @@ class InstrumentedVoicePool(AsyncAdaptedQueuePool):
 voice_engine = create_async_engine(
     DATABASE_URL,
     echo=False,
+    pool_pre_ping=True,
     pool_size=int(os.getenv("DB_VOICE_POOL_SIZE", "10")),
     max_overflow=int(os.getenv("DB_VOICE_MAX_OVERFLOW", "0")),
     pool_timeout=float(os.getenv("DB_VOICE_POOL_TIMEOUT", "0.25")),

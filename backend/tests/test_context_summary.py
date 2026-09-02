@@ -102,7 +102,7 @@ def test_summary_sanitizer_excludes_query_scoped_and_tool_payloads():
         {"role": "user", "content": "What did the report say?"},
         {
             "role": "developer",
-            "content": f"{QUERY_SCOPED_CONTEXT_MARKER}\nRAG_GROUNDED_TURN: raw",
+            "content": f"{QUERY_SCOPED_CONTEXT_MARKER}\nMSWIPE_KNOWLEDGE: raw",
         },
         {"role": "tool", "content": '{"large": "search payload"}'},
         {"role": "assistant", "content": "The report says the deadline is Friday."},

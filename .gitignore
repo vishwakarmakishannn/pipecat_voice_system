@@ -11,6 +11,7 @@ env/
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -65,6 +66,7 @@ VOICE_SYSTEM_2.0.md
 mswipe-email-agent/
 
 local_llm_start_command.txt
-RAG_LATENCY_ARCHITECTURE_PLAN
+RAG_LATENCY_ARCHITECTURE_PLAN.md
 rag_plan.md
 stt_test.py
+MSWIPE*

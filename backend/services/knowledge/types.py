@@ -13,6 +13,15 @@ RouteName = Literal[
     "human_handoff",
 ]
 
+KnowledgeAnswerType = Literal[
+    "fact",
+    "quantity",
+    "procedure",
+    "comparison",
+    "contact",
+    "policy",
+]
+
 
 @dataclass(frozen=True)
 class TurnRoute:
@@ -41,6 +50,8 @@ class KnowledgeHit:
     lexical_rank: float | None = None
     vector_similarity: float | None = None
     matched_by: tuple[str, ...] = ()
+    metadata: dict = field(default_factory=dict)
+    source_span: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -54,3 +65,10 @@ class KnowledgeResponse:
     confidence: float = 0.0
     hits: list[KnowledgeHit] = field(default_factory=list)
     reason: str | None = None
+    retrieval_mode: Literal["hybrid", "lexical_only", "unavailable"] = "unavailable"
+    dense_latency_ms: float | None = None
+    dense_failure_class: str | None = None
+    embedding_circuit_state: str | None = None
+    embedding_cache_outcome: str | None = None
+    answer_path: Literal["approved_direct", "grounded_synthesis", "no_answer"] = "no_answer"
+    direct_answer: str | None = None

@@ -1,8 +1,7 @@
 # Mswipe production knowledge system
 
-This subsystem is the reviewed factual layer for the Mswipe voice agent. It is
-independent from the existing user-upload RAG. The old tables and endpoints are
-left intact during rollout.
+This subsystem is the reviewed factual layer and the only document-knowledge
+path for the Mswipe voice agent.
 
 ## Architecture
 
@@ -28,7 +27,10 @@ normalizes conservative Mswipe/STT aliases, preserves customer and transaction
 identifiers, runs PostgreSQL full-text and optional pgvector retrieval, fuses
 and deduplicates candidates, applies a confidence threshold, and returns either
 evidence or a structured no-answer. The voice processor has its own deadline
-and injects query-scoped evidence only for the current turn.
+and exposes retrieval as the native `search_mswipe_knowledge` tool. The LLM
+selects it from the meaning of the full conversation. Successful tool output
+contains only bounded query-scoped evidence for the answer pass; unrelated
+turns never pay retrieval latency.
 
 Static knowledge never performs or authorizes live work. Customer-specific
 lookups and ticket writes are represented by the typed `MswipeApi` boundary;
@@ -53,7 +55,11 @@ MSWIPE_KNOWLEDGE_EMBEDDING_DIMENSION=768
 
 MSWIPE_KNOWLEDGE_TOP_K=4
 MSWIPE_KNOWLEDGE_MIN_CONFIDENCE=0.42
-MSWIPE_KNOWLEDGE_VOICE_TIMEOUT_SECONDS=0.8
+MSWIPE_KNOWLEDGE_TOOL_TIMEOUT_SECONDS=1.5
+MSWIPE_KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_SECONDS=0.6
+MSWIPE_KNOWLEDGE_TOOL_TOP_K=2
+MSWIPE_KNOWLEDGE_QUERY_CACHE_SIZE=256
+MSWIPE_KNOWLEDGE_QUERY_CACHE_TTL_SECONDS=600
 MSWIPE_KNOWLEDGE_MAX_CRAWL_PAGES=500
 MSWIPE_KNOWLEDGE_MAX_CRAWL_DEPTH=6
 MSWIPE_KNOWLEDGE_CRAWL_DELAY_SECONDS=0.25
@@ -66,6 +72,13 @@ For OpenAI embeddings, set the provider to `openai`, the model to
 `GOOGLE_API_KEY`. Provider, model, dimension, and content hash are stored with
 every vector. Never change the dimension after applying the migration; use a
 new migration and a new release for a dimensional model change.
+
+Dense query generation has a shorter deadline than the complete voice tool.
+Quota exhaustion, provider errors, or that deadline do not prevent backend
+startup and do not discard successful PostgreSQL lexical retrieval. They emit
+a degraded log and the turn continues with lexical evidence. Tune the dense
+deadline only from measured production latency; it must never exceed the voice
+tool deadline.
 
 `S3_BUCKET` plus AWS credentials makes raw snapshots private S3 objects. With
 no S3 configuration, the worker uses `MSWIPE_KNOWLEDGE_STORAGE_DIR`, which must
@@ -82,18 +95,22 @@ From the project root:
 ```bash
 docker compose up -d db
 docker compose run --rm migrate
-docker compose up -d knowledge-worker backend
+docker compose up -d knowledge-worker
 ```
 
-For a local virtual environment, run commands from `backend/`:
+Run the backend manually from `backend/` so voice logs stay visible:
 
 ```bash
 .venv/bin/python -m alembic upgrade head
-.venv/bin/python knowledge_worker.py
+uv run main.py
 ```
 
-The migration adds only new `knowledge_*` and `ticket_taxonomy_entries` tables.
-It does not modify or delete old RAG data.
+If the worker is also being run manually instead of through Compose, use
+`uv run knowledge_worker.py` in a separate terminal.
+
+The knowledge migration creates the `knowledge_*` and
+`ticket_taxonomy_entries` tables. A later migration removes the superseded
+per-user upload tables.
 
 ## Build the first corpus
 
@@ -230,9 +247,8 @@ Rollback is an atomic database transaction:
 
 To stop customer-visible knowledge immediately, set
 `MSWIPE_KNOWLEDGE_ENABLED=false` and restart the backend. This does not delete a
-release or corpus. Do not remove the legacy RAG, its API, UI, or tables until
-shadow traffic and the supported-intent pilot pass and a separate destructive
-change is explicitly approved.
+release or corpus. Use `release-rollback` to return atomically to an earlier
+approved release.
 
 ## What still requires Mswipe input
 
@@ -246,4 +262,8 @@ Before production traffic, Mswipe must provide and approve:
 - legal decisions for recording, PII retention, audit access, and regional use.
 
 Until those inputs exist, the system can serve reviewed public facts but will
-fail closed for customer-specific data and real ticket creation.
+fail closed for customer-specific data. The demo complaint workflow writes to
+the local `issues` table only after explicit confirmation. Its single adapter
+boundary is `_create_issue_record` in `tools/raise_issue.py`; production must
+replace that function with the approved authenticated and idempotent Mswipe
+ticket API call while keeping the state machine and confirmation gate.

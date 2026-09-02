@@ -1,31 +1,35 @@
 import re
 import asyncio
-import time
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
 from pipecat.frames.frames import OutputTransportMessageFrame, TTSSpeakFrame
-from pipecat.processors.aggregators.llm_context import NOT_GIVEN
 from pipecat.services.llm_service import (
     FunctionCallParams,
     FunctionCallResultProperties,
 )
 from core.database import VoiceSessionLocal
+from core.issue_contract import (
+    ISSUE_CONTRACT_VERSION,
+    ISSUE_FIELDS,
+    ISSUE_REQUIRED_FIELDS,
+    ValidationCode,
+    safe_issue_field_states,
+)
 from core.models import Issue
 from core.task_queue import task_queue
-from core.tool_config import issue_tool_timeout_seconds, tool_filler_enabled
+from core.tool_privacy import sanitize_tool_data
+from core.tool_config import issue_tool_timeout_seconds
 from services.calls import save_transcript_entry
+from services.structured_digits import (
+    NORMALIZATION_VERSION,
+    DigitSequence,
+    extract_digit_sequences,
+    unique_sequence_for_length,
+)
 
-
-ISSUE_REQUIRED_FIELDS = ("cust_id", "email", "mobile", "device_id", "description")
-ISSUE_FIELD_LABELS = {
-    "cust_id": "customer ID",
-    "email": "email address",
-    "mobile": "mobile number",
-    "device_id": "device ID",
-    "description": "issue description",
-}
 
 _SPOKEN_EMAIL_AT = re.compile(
     r"\b(?:at\s+the\s+rate|at\s+sign|at)\b",
@@ -35,7 +39,7 @@ _SPOKEN_EMAIL_DOT = re.compile(r"\b(?:dot|point)\b", re.IGNORECASE)
 _EMAIL_CANDIDATE = re.compile(
     r"(?<![a-z0-9._%+-])"
     r"([a-z0-9][a-z0-9._%+-]*)\s*@\s*"
-    r"([a-z0-9-]+(?:\s*\.\s*[a-z0-9-]+)+)",
+    r"([a-z0-9-]+(?:\.[a-z0-9-]+)+)",
     re.IGNORECASE,
 )
 _EMAIL_DOMAIN_AFTER_AT = re.compile(
@@ -43,15 +47,17 @@ _EMAIL_DOMAIN_AFTER_AT = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_LOCAL_TOKEN = re.compile(r"[a-z0-9][a-z0-9._%+-]*", re.IGNORECASE)
-_FIELD_FRAGMENT_TTL_SECONDS = 8.0
-_FIELD_FRAGMENT_MAX_TURNS = 3
-_FIELD_FRAGMENT_MAX_CHARS = 320
 
 
 def normalize_spoken_email(text: str) -> str | None:
     """Extract one schema-valid email from finalized text or voice dictation."""
     spoken = _SPOKEN_EMAIL_AT.sub("@", text or "")
-    spoken = _SPOKEN_EMAIL_DOT.sub(".", spoken)
+    spoken = re.sub(
+        r"\s*\b(?:dot|point)\b\s*",
+        ".",
+        spoken,
+        flags=re.IGNORECASE,
+    )
     matches = {
         f"{match.group(1)}@{re.sub(r'\s+', '', match.group(2))}".casefold()
         for match in _EMAIL_CANDIDATE.finditer(spoken)
@@ -62,7 +68,12 @@ def normalize_spoken_email(text: str) -> str | None:
         # and domain land in different finals). During explicit email dictation,
         # recover the field structurally instead of enumerating ASR mistakes.
         loose_matches: set[str] = set()
-        raw = text or ""
+        raw = re.sub(
+            r"\s*\b(?:dot|point)\b\s*",
+            ".",
+            text or "",
+            flags=re.IGNORECASE,
+        )
         if re.search(r"\bemail\b", raw, re.IGNORECASE):
             for at_match in _SPOKEN_EMAIL_AT.finditer(raw):
                 local_tokens = _EMAIL_LOCAL_TOKEN.findall(raw[: at_match.start()])
@@ -84,19 +95,25 @@ class IssueWorkflowState:
     """Per-call complaint draft controlled by semantic tool calls, not text rules."""
 
     status: str = "idle"
-    customer_name: str | None = None
     cust_id: str | None = None
     email: str | None = None
     mobile: str | None = None
     device_id: str | None = None
     description: str | None = None
-    provenance: dict[str, str] = field(default_factory=dict)
-    source_refs: list[dict[str, Any]] = field(default_factory=list)
-    evidence_id: str | None = None
+    provenance: dict[str, dict[str, Any]] = field(default_factory=dict)
+    validation_states: dict[str, ValidationCode] = field(
+        default_factory=lambda: {
+            name: "missing" for name in ISSUE_REQUIRED_FIELDS
+        }
+    )
     issue_id: int | None = None
     current_user_text: str = ""
-    current_field_candidates: dict[str, str] = field(default_factory=dict)
-    field_fragment_buffer: list[tuple[float, str]] = field(
+    current_turn_id: int | None = None
+    protected_corrections: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    recent_user_turns: list[tuple[int | None, str]] = field(
         default_factory=list,
         repr=False,
     )
@@ -104,27 +121,34 @@ class IssueWorkflowState:
 
     def reset(self) -> None:
         self.status = "idle"
-        self.customer_name = None
         self.cust_id = None
         self.email = None
         self.mobile = None
         self.device_id = None
         self.description = None
         self.provenance.clear()
-        self.source_refs.clear()
-        self.evidence_id = None
+        self.validation_states = {
+            name: "missing" for name in ISSUE_REQUIRED_FIELDS
+        }
         self.issue_id = None
-        self.field_fragment_buffer.clear()
+        self.protected_corrections.clear()
+        self.recent_user_turns = (
+            [(self.current_turn_id, self.current_user_text)]
+            if self.current_user_text
+            else []
+        )
 
     def draft(self) -> dict[str, Any]:
         return {
-            "customer_name": self.customer_name,
             "cust_id": self.cust_id,
             "email": self.email,
             "mobile": self.mobile,
             "device_id": self.device_id,
             "description": self.description,
         }
+
+    def public_fields(self) -> dict[str, dict[str, str | bool | None]]:
+        return safe_issue_field_states(self.draft(), self.validation_states)
 
     def missing_fields(self) -> list[str]:
         return [name for name in ISSUE_REQUIRED_FIELDS if not getattr(self, name)]
@@ -141,50 +165,26 @@ class IssueWorkflowState:
             "The backend is the only authority for workflow outcomes. Call "
             "manage_issue_draft exactly once: update for supplied fields, confirm "
             "or cancel for the user's decision, status for a progress question, "
+            "retry when the caller asks to retry protected recent field dictation, "
             "or defer when the turn does not decide or change the draft. Never "
             "state that an issue was submitted unless the tool result contains "
-            "status=success and an issue_id. "
-            "Tavily remains available for a separate public web-search request, and a "
-            "web search must not change or close this draft."
+            "status=success and an issue_id. An unrelated turn must use defer and "
+            "leave the complaint draft unchanged."
         )
 
-    def observe_user_turn(self, text: str) -> None:
-        """Bind field candidates to the exact finalized turn seen by the router."""
-        raw_text = " ".join((text or "").split())
-        self.current_user_text = raw_text
-        self.current_field_candidates.clear()
-        if self.status != "collecting_fields" or "email" not in self.missing_fields():
-            self.field_fragment_buffer.clear()
-            return
+    def observe_user_turn(self, text: str, *, turn_id: int | None = None) -> None:
+        """Bind evidence to the authoritative assembled turn seen by the router."""
+        self.current_user_text = " ".join((text or "").split())
+        self.current_turn_id = turn_id
+        if self.current_user_text:
+            entry = (turn_id, self.current_user_text)
+            if not self.recent_user_turns or self.recent_user_turns[-1] != entry:
+                self.recent_user_turns.append(entry)
+                del self.recent_user_turns[:-4]
 
-        now = time.monotonic()
-        self.field_fragment_buffer = [
-            (seen_at, fragment)
-            for seen_at, fragment in self.field_fragment_buffer
-            if now - seen_at <= _FIELD_FRAGMENT_TTL_SECONDS
-        ]
-        if raw_text:
-            self.field_fragment_buffer.append((now, raw_text))
-        self.field_fragment_buffer = self.field_fragment_buffer[
-            -_FIELD_FRAGMENT_MAX_TURNS:
-        ]
-
-        fragments = [fragment for _seen_at, fragment in self.field_fragment_buffer]
-        candidates = [raw_text]
-        candidates.extend(
-            " ".join(fragments[-count:])[-_FIELD_FRAGMENT_MAX_CHARS:]
-            for count in range(2, len(fragments) + 1)
-        )
-        for candidate_text in candidates:
-            if email := normalize_spoken_email(candidate_text):
-                self.current_user_text = candidate_text
-                self.current_field_candidates["email"] = email
-                return
-
-    def candidate_for_missing_field(self) -> tuple[str, str] | None:
-        for name in self.missing_fields():
-            if value := self.current_field_candidates.get(name):
-                return name, value
+    def candidate_for_missing_field(self) -> None:
+        # Field parsing is deliberately kept out of the semantic router.  The
+        # tool aligns structured candidates with this authoritative turn.
         return None
 
     def sensitive_values(self) -> dict[str, str]:
@@ -193,35 +193,6 @@ class IssueWorkflowState:
             for name in ("cust_id", "email", "mobile", "device_id")
             if (value := getattr(self, name))
         }
-
-
-async def _publish_tool_filler(params: FunctionCallParams) -> None:
-    worker = getattr(params, "pipeline_worker", None)
-    resources = getattr(params, "app_resources", None)
-    state = resources.get("latency_state") if isinstance(resources, dict) else None
-    if worker is None or not tool_filler_enabled():
-        return
-    if state is not None and state.tool_filler_spoken:
-        return
-    if state is not None:
-        state.tool_filler_spoken = True
-    tool_call_id = getattr(params, "tool_call_id", None) or "raise-issue"
-    filler_text = "Let me check that."
-    await worker.queue_frames([
-        OutputTransportMessageFrame({
-            "label": "rtvi-ai",
-            "type": "server-message",
-            "data": {
-                "type": "assistant_transcript",
-                "payload": {
-                    "id": f"tool-filler-{tool_call_id}",
-                    "text": filler_text,
-                    "source": "tool_filler",
-                },
-            },
-        }),
-        TTSSpeakFrame(filler_text, append_to_context=False),
-    ])
 
 
 async def _publish_tool_event(
@@ -234,29 +205,23 @@ async def _publish_tool_event(
     if worker is None:
         return
     payload = {
-        "tool_call_id": getattr(params, "tool_call_id", None) or "raise-issue",
-        "function_name": getattr(params, "function_name", None) or "raise_issue",
-        "arguments": dict(getattr(params, "arguments", {}) or {}),
+        "tool_call_id": getattr(params, "tool_call_id", None) or "manage-issue-draft",
+        "function_name": (
+            getattr(params, "function_name", None) or "manage_issue_draft"
+        ),
+        "arguments": sanitize_tool_data(
+            "manage_issue_draft",
+            dict(getattr(params, "arguments", {}) or {}),
+        ),
         "status": status,
     }
     if result is not None:
-        payload["result"] = result
+        payload["result"] = sanitize_tool_data("manage_issue_draft", result)
     await worker.queue_frame(OutputTransportMessageFrame({
         "label": "rtvi-ai",
         "type": "server-message",
         "data": {"type": "tool_call", "payload": payload},
     }))
-
-
-async def _return_tool_result(params: FunctionCallParams, result: dict) -> None:
-    await _publish_tool_event(params, "completed", result)
-    context = getattr(params, "context", None)
-    if context is not None:
-        context.set_tools([])
-        context.set_tool_choice(NOT_GIVEN)
-    await params.result_callback(result)
-
-
 def _workflow_state(params: FunctionCallParams) -> IssueWorkflowState:
     resources = getattr(params, "app_resources", None)
     if not isinstance(resources, dict):
@@ -283,189 +248,98 @@ def _latest_user_text(
     return ""
 
 
-def _latest_rag_payload(params: FunctionCallParams) -> dict[str, Any] | None:
-    resources = getattr(params, "app_resources", None)
-    retrieval = resources.get("context_retrieval") if isinstance(resources, dict) else None
-    payload = getattr(retrieval, "latest_rag_evidence", None)
-    return payload if isinstance(payload, dict) else None
-
-
-def _grounded_anchor(params: FunctionCallParams, evidence_id: str | None = None):
-    resources = getattr(params, "app_resources", None)
-    retrieval = resources.get("context_retrieval") if isinstance(resources, dict) else None
-    resolver = getattr(retrieval, "grounded_evidence", None)
-    if not callable(resolver):
-        return None
-    return resolver(evidence_id, immediate_only=True)
-
-
-def _available_rag_payload(params: FunctionCallParams, anchor):
-    """Return fresh anchored evidence, retaining compatibility with old callers."""
-    resources = getattr(params, "app_resources", None)
-    retrieval = resources.get("context_retrieval") if isinstance(resources, dict) else None
-    if callable(getattr(retrieval, "grounded_evidence", None)):
-        return getattr(anchor, "payload", None) if anchor is not None else None
-    return _latest_rag_payload(params)
-
-
-def _rag_evidence(payload: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:
-    chunks = (
-        payload.get("result", {}).get("chunks", [])
-        if isinstance(payload, dict)
-        else []
-    )
-    usable = [chunk for chunk in chunks if isinstance(chunk, dict)]
-    text = "\n".join(
-        str(chunk.get("content") or "")
-        for chunk in usable
-        if chunk.get("content")
-    )
-    refs = [
-        {
-            key: chunk.get(key)
-            for key in (
-                "id",
-                "file_id",
-                "source_type",
-                "filename",
-                "title",
-                "url",
-                "page_start",
-                "page_end",
-                "heading_path",
-            )
-        }
-        for chunk in usable
-    ]
-    return text, refs
-
-
-_EVIDENCE_FIELD_PATTERNS = {
-    "cust_id": re.compile(r"\bC\d{6}\b", re.IGNORECASE),
-    "email": re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b"),
-    "mobile": re.compile(r"\b[6-9]\d{9}\b"),
-    "device_id": re.compile(r"\bMSW\d{8}\b", re.IGNORECASE),
-}
-
-
-def _unique_grounded_fields(
-    payload: dict[str, Any],
-) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Extract only unambiguous schema-valid values from supporting chunks."""
-    chunks = payload.get("result", {}).get("chunks", [])
-    values: dict[str, set[str]] = {name: set() for name in _EVIDENCE_FIELD_PATTERNS}
-    chunk_values: list[tuple[dict[str, Any], dict[str, set[str]]]] = []
-    for chunk in chunks:
-        if not isinstance(chunk, dict):
-            continue
-        content = str(chunk.get("content") or "")
-        found: dict[str, set[str]] = {}
-        for name, pattern in _EVIDENCE_FIELD_PATTERNS.items():
-            matches = {
-                match.upper() if name in {"cust_id", "device_id"} else match
-                for match in pattern.findall(content)
-            }
-            if matches:
-                found[name] = matches
-                values[name].update(matches)
-        chunk_values.append((chunk, found))
-
-    unique = {
-        name: next(iter(found))
-        for name, found in values.items()
-        if len(found) == 1
-    }
-    supporting = [
-        chunk
-        for chunk, found in chunk_values
-        if any(value in found.get(name, set()) for name, value in unique.items())
-    ]
-
-    # A single complaint-like record can safely supply its own description
-    # when at least two independent structured identifiers co-occur. Multiple
-    # equally plausible records remain unresolved and are never guessed.
-    description_rows = [
-        chunk
-        for chunk, found in chunk_values
-        if sum(
-            value in found.get(name, set())
-            for name, value in unique.items()
-        ) >= 2
-    ]
-    if len(description_rows) == 1:
-        description = re.sub(
-            r"\s+", " ", str(description_rows[0].get("content") or "")
-        ).strip()
-        if _valid_field("description", description):
-            unique["description"] = description[:1000]
-            if description_rows[0] not in supporting:
-                supporting.append(description_rows[0])
-    return unique, supporting
-
-
-def _source_refs(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            key: chunk.get(key)
-            for key in (
-                "id",
-                "file_id",
-                "source_type",
-                "filename",
-                "title",
-                "url",
-                "page_start",
-                "page_end",
-                "heading_path",
-            )
-        }
-        for chunk in chunks
-    ]
 
 
 def _valid_field(name: str, value: str) -> bool:
-    if name == "cust_id":
-        return bool(re.fullmatch(r"C\d{6}", value))
-    if name == "email":
-        return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value))
-    if name == "mobile":
-        return bool(re.fullmatch(r"[6-9]\d{9}", value))
-    if name == "device_id":
-        return bool(re.fullmatch(r"MSW\d{8}", value))
-    if name == "description":
-        return len(value.strip()) >= 8
-    if name == "customer_name":
-        return bool(value.strip())
-    return False
+    contract = ISSUE_FIELDS.get(name)
+    return bool(contract and contract.validate(value)[0] == "unverified")
 
 
-def _description_supported(value: str, evidence_text: str) -> bool:
-    candidate = {
-        token
-        for token in re.findall(r"[a-z0-9]+", value.casefold())
-        if len(token) > 2
-    }
-    evidence = set(re.findall(r"[a-z0-9]+", evidence_text.casefold()))
-    if not candidate:
-        return False
-    overlap = len(candidate & evidence)
-    return overlap >= min(4, max(2, len(candidate) // 2))
+def _source_hash(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
-def _candidate_provenance(
+def _numeric_evidence(
     name: str,
-    value: str,
     latest_user_text: str,
-    evidence_text: str,
-) -> str | None:
-    normalized = value.casefold()
-    if normalized in latest_user_text.casefold():
-        return "user"
-    if name == "description":
-        return "rag" if _description_supported(value, evidence_text) else None
-    if normalized in evidence_text.casefold():
-        return "rag"
-    return None
+) -> tuple[str | None, ValidationCode, DigitSequence | None]:
+    contract = ISSUE_FIELDS[name]
+    assert contract.digit_count is not None
+    exact = unique_sequence_for_length(latest_user_text, contract.digit_count)
+    if exact is not None:
+        canonical = contract.canonicalize(exact.value)
+        code, canonical = contract.validate(canonical)
+        return (canonical if code == "unverified" else None), code, exact
+
+    sequences = extract_digit_sequences(latest_user_text)
+    if len(sequences) != 1:
+        return None, "invalid_format", None
+    sequence = sequences[0]
+    canonical = contract.canonicalize(sequence.value)
+    code, canonical = contract.validate(canonical)
+    return None, code, sequence
+
+
+def _aligned_candidate(
+    name: str,
+    raw_value: str,
+    *,
+    latest_user_text: str,
+    turn_id: int | None,
+) -> tuple[str | None, ValidationCode, dict[str, Any]]:
+    contract = ISSUE_FIELDS[name]
+    source_hash = _source_hash(latest_user_text)
+    if contract.digit_count is not None:
+        value, code, sequence = _numeric_evidence(name, latest_user_text)
+        provenance = {
+            "source_type": "user_spoken_digits",
+            "turn_id": turn_id,
+            "source_hash": source_hash,
+            "source_span": (
+                [sequence.start, sequence.end] if sequence is not None else None
+            ),
+            "normalization_version": NORMALIZATION_VERSION,
+            "verification": "not_configured",
+        }
+        return value, code, provenance
+
+    if contract.kind == "email":
+        value = normalize_spoken_email(latest_user_text)
+        code, canonical = contract.validate(value)
+        return (
+            canonical if code == "unverified" else None,
+            code,
+            {
+                "source_type": "user_spoken_email",
+                "turn_id": turn_id,
+                "source_hash": source_hash,
+                "normalization_version": "spoken-email-v1",
+                "verification": "not_configured",
+            },
+        )
+
+    code, canonical = contract.validate(raw_value)
+    # A problem description may be summarized by the LLM, but its source turn
+    # remains attributable and the confirmation never invents a person's name.
+    if code == "unverified" and latest_user_text:
+        return (
+            canonical,
+            code,
+            {
+                "source_type": "llm_summary_of_user_report",
+                "turn_id": turn_id,
+                "source_hash": source_hash,
+                "normalization_version": "description-summary-v1",
+                "verification": "not_applicable",
+            },
+        )
+    return None, code, {
+        "source_type": "unattributed",
+        "turn_id": turn_id,
+        "source_hash": source_hash,
+        "normalization_version": "none",
+        "verification": "not_configured",
+    }
 
 
 def _merge_draft_fields(
@@ -473,46 +347,105 @@ def _merge_draft_fields(
     candidates: dict[str, str | None],
     *,
     latest_user_text: str,
-    evidence_text: str,
-    accept_structured_arguments: bool = False,
-) -> list[str]:
-    invalid: list[str] = []
+    turn_id: int | None = None,
+) -> dict[str, ValidationCode]:
+    rejected: dict[str, ValidationCode] = {}
     for name, raw_value in candidates.items():
         if raw_value is None:
             continue
-        value = str(raw_value).strip()
-        if name in {"cust_id", "device_id"}:
-            value = value.upper()
-        if not _valid_field(name, value):
-            invalid.append(name)
+        contract = ISSUE_FIELDS.get(name)
+        if contract is None:
             continue
-        provenance = _candidate_provenance(
+        raw_text = str(raw_value).strip()
+        argument_canonical = contract.canonicalize(raw_text)
+        if (
+            getattr(state, name) == argument_canonical
+            and state.validation_states.get(name) == "unverified"
+        ):
+            # Models commonly repeat already accepted values.  Repetition does
+            # not change their original evidence or verification state.
+            continue
+        value, code, provenance = _aligned_candidate(
             name,
-            value,
-            latest_user_text,
-            evidence_text,
+            raw_text,
+            latest_user_text=latest_user_text,
+            turn_id=turn_id,
         )
-        # Existing validated values can be repeated by the model without having
-        # to appear verbatim in the latest user utterance again.
-        if provenance is None and getattr(state, name) == value:
-            provenance = state.provenance.get(name, "workflow")
-        # Explicit function arguments are the LLM's structured interpretation of
-        # the current conversation. Once they satisfy the deterministic field
-        # schema, retain them for the mandatory confirmation turn instead of
-        # requiring a second, independent text parser to reach the same value.
-        # RAG hydration does not use this path and remains evidence-validated.
-        if provenance is None and accept_structured_arguments:
-            provenance = "llm_interpreted"
-        if provenance is None:
-            invalid.append(name)
+        state.validation_states[name] = code
+        if value is None or code != "unverified":
+            setattr(state, name, None)
+            state.provenance.pop(name, None)
+            state.protected_corrections[name] = {
+                "state": code,
+                "candidate_hash": _source_hash(argument_canonical),
+                "turn_id": turn_id,
+            }
+            rejected[name] = code
             continue
         setattr(state, name, value)
         state.provenance[name] = provenance
-    return invalid
+        state.protected_corrections.pop(name, None)
+    return rejected
+
+
+def _retry_recent_evidence(
+    state: IssueWorkflowState,
+) -> dict[str, ValidationCode]:
+    """Re-run deterministic extraction over a short protected in-memory window."""
+    rejected: dict[str, ValidationCode] = {}
+    for name in ("cust_id", "email", "mobile", "device_id"):
+        if getattr(state, name):
+            continue
+        matches: dict[str, dict[str, Any]] = {}
+        for turn_id, user_text in reversed(state.recent_user_turns):
+            value, code, provenance = _aligned_candidate(
+                name,
+                "",
+                latest_user_text=user_text,
+                turn_id=turn_id,
+            )
+            if value is not None and code == "unverified":
+                matches[value] = provenance
+        if len(matches) == 1:
+            value, provenance = next(iter(matches.items()))
+            setattr(state, name, value)
+            state.validation_states[name] = "unverified"
+            state.provenance[name] = provenance
+            state.protected_corrections.pop(name, None)
+        elif len(matches) > 1:
+            state.validation_states[name] = "invalid_format"
+            rejected[name] = "invalid_format"
+    return rejected
+
+
+def _draft_result(
+    state: IssueWorkflowState,
+    message: str,
+    rejected: dict[str, ValidationCode],
+) -> dict[str, Any]:
+    return {
+        "status": state.status,
+        "message": message,
+        "contract_version": ISSUE_CONTRACT_VERSION,
+        "missing_fields": state.missing_fields(),
+        "invalid_fields": list(rejected),
+        "validation_outcomes": dict(rejected),
+        "fields": state.public_fields(),
+        "provenance": {
+            name: {
+                "source_type": value.get("source_type"),
+                "turn_id": value.get("turn_id"),
+                "source_hash": value.get("source_hash"),
+                "normalization_version": value.get("normalization_version"),
+                "verification": value.get("verification"),
+            }
+            for name, value in state.provenance.items()
+        },
+    }
 
 
 def _field_list(names: list[str]) -> str:
-    labels = [ISSUE_FIELD_LABELS.get(name, name) for name in names]
+    labels = [ISSUE_FIELDS[name].label if name in ISSUE_FIELDS else name for name in names]
     if len(labels) <= 1:
         return labels[0] if labels else ""
     return ", ".join(labels[:-1]) + f" and {labels[-1]}"
@@ -521,24 +454,32 @@ def _field_list(names: list[str]) -> str:
 def _workflow_message(
     state: IssueWorkflowState,
     *,
-    invalid: list[str] | None = None,
+    rejected: dict[str, ValidationCode] | None = None,
 ) -> str:
-    invalid = invalid or []
+    rejected = rejected or {}
     missing = state.missing_fields()
-    if invalid:
-        invalid_text = _field_list(invalid)
-        if missing:
-            return (
-                f"I couldn't verify the {invalid_text}. I still need "
-                f"{_field_list(missing)} before I can prepare the issue."
+    if rejected:
+        corrections = [
+            ISSUE_FIELDS[name].correction(code)
+            for name, code in rejected.items()
+        ]
+        other_missing = [name for name in missing if name not in rejected]
+        if other_missing:
+            corrections.append(
+                f"I also still need {_field_list(other_missing)} before I can prepare the issue."
             )
-        return f"I couldn't verify the {invalid_text}. Please provide it again."
+        return " ".join(corrections)
     if missing:
         return f"I still need {_field_list(missing)} before I can prepare the issue."
+    masked = {
+        name: ISSUE_FIELDS[name].masked(getattr(state, name))
+        for name in ("cust_id", "email", "mobile", "device_id")
+    }
     return (
-        "I have the complaint details ready: customer ID "
-        f"{state.cust_id}, email {state.email}, mobile {state.mobile}, device ID "
-        f"{state.device_id}, and description: {state.description}. "
+        "I have the complaint details ready: customer ID ending "
+        f"{masked['cust_id'][-4:]}, email {masked['email']}, mobile ending "
+        f"{masked['mobile'][-4:]}, device ID ending {masked['device_id'][-4:]}, "
+        "and the issue description you provided. "
         "Would you like me to submit it?"
     )
 
@@ -592,6 +533,7 @@ async def _finish_workflow_call(
 
 
 async def _create_issue_record(state: IssueWorkflowState) -> int:
+    """Persist the demo issue; replace this boundary with the production API."""
     async with asyncio.timeout(issue_tool_timeout_seconds()):
         async with VoiceSessionLocal() as session:
             new_issue = Issue(
@@ -610,9 +552,9 @@ async def _create_issue_record(state: IssueWorkflowState) -> int:
 
 async def manage_issue_draft(
     params: FunctionCallParams,
-    operation: Literal["start", "update", "confirm", "cancel", "status", "defer"],
-    evidence_id: str | None = None,
-    customer_name: str | None = None,
+    operation: Literal[
+        "start", "update", "confirm", "cancel", "status", "retry", "defer"
+    ],
     cust_id: str | None = None,
     email: str | None = None,
     mobile: str | None = None,
@@ -627,18 +569,21 @@ async def manage_issue_draft(
     state is ``awaiting_confirmation``.
 
     Args:
-        operation: One of start, update, confirm, cancel, status, or defer. Use start for the
+        operation: One of start, update, confirm, cancel, status, retry, or defer. Use start for the
             initial action request, update when the user supplies or corrects
             details, confirm only after the assistant asked for confirmation,
             cancel when the user declines or abandons the draft, status for a
-            progress question, and defer when the turn does not change the draft.
-        evidence_id: Grounded evidence anchor from the immediately preceding
-            retrieved turn when this action continues that turn.
-        customer_name: Customer name when established by the conversation.
-        cust_id: Customer ID, C followed by exactly 6 digits.
+            progress question, retry when the caller asks to retry recent field
+            dictation after a transient failure, and defer when the turn does not
+            change the draft.
+        cust_id: Demo customer ID candidate. The temporary demo-v1-unverified
+            contract expects C followed by exactly 6 digits; this is format
+            validation, not customer verification.
         email: Customer email address.
-        mobile: Ten-digit Indian mobile number beginning with 6, 7, 8, or 9.
-        device_id: Device ID, MSW followed by exactly 8 digits.
+        mobile: Demo mobile candidate. The temporary demo contract expects ten
+            digits beginning with 6, 7, 8, or 9.
+        device_id: Demo device ID candidate. The temporary demo contract expects
+            MSW followed by exactly 8 digits.
         description: Concise, grounded description of the reported problem.
     """
     state = _workflow_state(params)
@@ -754,6 +699,29 @@ async def manage_issue_draft(
             )
         return
 
+    if operation == "retry":
+        if state.status not in {"collecting_fields", "awaiting_confirmation"}:
+            message = "There is no active complaint draft to retry."
+            await _finish_workflow_call(
+                params,
+                {"status": "invalid_transition", "message": message},
+                message,
+            )
+            return
+        rejected = _retry_recent_evidence(state)
+        state.status = (
+            "collecting_fields"
+            if state.missing_fields() or rejected
+            else "awaiting_confirmation"
+        )
+        message = _workflow_message(state, rejected=rejected)
+        await _finish_workflow_call(
+            params,
+            _draft_result(state, message, rejected),
+            message,
+        )
+        return
+
     if operation not in {"start", "update"}:
         message = "I couldn't determine the requested complaint action."
         await _finish_workflow_call(
@@ -778,35 +746,9 @@ async def manage_issue_draft(
         )
         return
 
-    explicit_required_values = any(
-        value is not None
-        for value in (cust_id, email, mobile, device_id, description)
-    )
-    anchor = _grounded_anchor(params, evidence_id)
-    implicitly_bound = (
-        operation == "start"
-        and anchor is not None
-        and not explicit_required_values
-    )
-    bound_anchor = anchor if evidence_id or implicitly_bound else None
-    payload = _available_rag_payload(params, bound_anchor or anchor)
-    evidence_text, all_source_refs = _rag_evidence(payload)
-    hydrated: dict[str, str] = {}
-    source_refs: list[dict[str, Any]] = []
-    if bound_anchor is not None and isinstance(payload, dict):
-        hydrated, supporting_chunks = _unique_grounded_fields(payload)
-        source_refs = _source_refs(supporting_chunks)
-        state.evidence_id = getattr(bound_anchor, "evidence_id", evidence_id)
-        _merge_draft_fields(
-            state,
-            hydrated,
-            latest_user_text=_latest_user_text(params, state),
-            evidence_text=evidence_text,
-        )
-    invalid = _merge_draft_fields(
+    rejected = _merge_draft_fields(
         state,
         {
-            "customer_name": customer_name,
             "cust_id": cust_id,
             "email": email,
             "mobile": mobile,
@@ -814,34 +756,15 @@ async def manage_issue_draft(
             "description": description,
         },
         latest_user_text=_latest_user_text(params, state),
-        evidence_text=evidence_text,
-        accept_structured_arguments=True,
+        turn_id=state.current_turn_id,
     )
-    if state.email:
-        state.field_fragment_buffer.clear()
-    if (
-        (source_refs or all_source_refs)
-        and not state.source_refs
-        and any(source == "rag" for source in state.provenance.values())
-    ):
-        state.source_refs = source_refs or all_source_refs
     state.status = (
         "collecting_fields"
-        if state.missing_fields() or invalid
+        if state.missing_fields() or rejected
         else "awaiting_confirmation"
     )
-    message = _workflow_message(state, invalid=invalid)
-    result = {
-        "status": state.status,
-        "message": message,
-        "missing_fields": state.missing_fields(),
-        "invalid_fields": invalid,
-        "draft": state.draft(),
-        "provenance": dict(state.provenance),
-        "evidence_id": state.evidence_id,
-        "hydrated_fields": sorted(hydrated),
-        "source_refs": list(state.source_refs),
-    }
+    message = _workflow_message(state, rejected=rejected)
+    result = _draft_result(state, message, rejected)
     await _finish_workflow_call(params, result, message)
 
 
@@ -860,80 +783,3 @@ def openai_manage_issue_tool_schema() -> dict:
             },
         },
     }
-
-
-async def raise_issue(
-    params: FunctionCallParams,
-    cust_id: str,
-    email: str,
-    mobile: str,
-    device_id: str,
-    description: str
-):
-    """Raise a complaint issue and save it to the database.
-    
-    Args:
-        cust_id: Customer ID. Must start with 'C' followed by 6 digits (e.g. C123456).
-        email: Customer's email address.
-        mobile: Customer's mobile number. Must be a 10-digit Indian number starting with 6, 7, 8, or 9 (exclude +91).
-        device_id: Device ID. Must start with 'MSW' followed by 8 digits (e.g. MSW12345678).
-        description: A brief description of the issue.
-    """
-    await _publish_tool_filler(params)
-    await _publish_tool_event(params, "in_progress")
-    errors = []
-    
-    if not re.match(r"^C\d{6}$", cust_id):
-        errors.append("Invalid cust_id format. Must start with 'C' followed by 6 digits.")
-        
-    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
-        errors.append("Invalid email format.")
-        
-    if not re.match(r"^[6-9]\d{9}$", mobile):
-        errors.append("Invalid mobile format. Must be a 10-digit number starting with 6, 7, 8, or 9.")
-        
-    if not re.match(r"^MSW\d{8}$", device_id):
-        errors.append("Invalid device_id format. Must start with 'MSW' followed by 8 digits.")
-        
-    if errors:
-        error_msg = "Validation failed: " + "; ".join(errors) + " Please ask the user for correct information."
-        await _return_tool_result(params, {"status": "error", "message": error_msg})
-        return
-
-    try:
-        async with asyncio.timeout(issue_tool_timeout_seconds()):
-            async with VoiceSessionLocal() as session:
-                new_issue = Issue(
-                    cust_id=cust_id,
-                    email=email,
-                    mobile=mobile,
-                    device_id=device_id,
-                    description=description
-                )
-                session.add(new_issue)
-                # Flush performs the INSERT and populates the generated primary
-                # key. A post-commit refresh would add a second database round
-                # trip solely to read data we already have.
-                await session.flush()
-                issue_id = new_issue.id
-                await session.commit()
-    except TimeoutError:
-        await _return_tool_result(params, {
-            "status": "timeout",
-            "message": "Issue creation timed out and was not confirmed. Ask the user to retry later.",
-        })
-        return
-    except asyncio.CancelledError:
-        await _publish_tool_event(params, "cancelled")
-        raise
-    except Exception:
-        await _return_tool_result(params, {
-            "status": "error",
-            "message": "Issue creation failed and was not confirmed. Ask the user to retry later.",
-        })
-        return
-    
-    await _return_tool_result(params, {
-        "status": "success",
-        "message": f"Issue #{issue_id} has been successfully raised."
-    })

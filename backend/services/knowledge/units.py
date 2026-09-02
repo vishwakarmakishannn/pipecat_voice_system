@@ -56,6 +56,19 @@ def unit_content_hash(value: UnitInput) -> str:
     return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
 
 
+def _stored_unit_content_hash(unit: KnowledgeUnit) -> str:
+    fields = (
+        unit.unit_type,
+        unit.title,
+        unit.question or "",
+        unit.answer,
+        unit.voice_answer or "",
+        unit.retrieval_text,
+        unit.source_uri,
+    )
+    return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
+
+
 def _validate(value: UnitInput) -> None:
     if value.unit_type not in KNOWLEDGE_UNIT_TYPES:
         raise ValueError(f"Unsupported knowledge unit type: {value.unit_type}")
@@ -123,6 +136,9 @@ async def approve_unit(
     *,
     approved_by_user_id: int | None = None,
     review_notes: str | None = None,
+    voice_answer: str | None = None,
+    atomic_answer: bool | None = None,
+    answerability_reviewed: bool | None = None,
 ) -> KnowledgeUnit:
     result = await db.execute(
         select(KnowledgeUnit).where(KnowledgeUnit.id == unit_id).with_for_update()
@@ -130,6 +146,21 @@ async def approve_unit(
     unit = result.scalars().first()
     if unit is None:
         raise ValueError("Knowledge unit not found")
+    if voice_answer is not None:
+        cleaned_voice_answer = " ".join(voice_answer.split())
+        if not cleaned_voice_answer:
+            raise ValueError("voice_answer must contain spoken text")
+        unit.voice_answer = cleaned_voice_answer
+    metadata = dict(unit.metadata_json or {})
+    if atomic_answer is not None:
+        metadata["atomic_answer"] = atomic_answer
+    if answerability_reviewed is not None:
+        metadata["answerability_reviewed"] = answerability_reviewed
+    metadata["voice_answer_approved"] = bool(
+        unit.voice_answer and answerability_reviewed is True
+    )
+    unit.metadata_json = metadata
+    unit.content_hash = _stored_unit_content_hash(unit)
     unit.status = "approved"
     unit.approved_by_user_id = approved_by_user_id
     unit.approved_at = datetime.now(timezone.utc)

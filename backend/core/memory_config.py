@@ -58,6 +58,9 @@ MEMORY_SUMMARY_MAX_CHARS = env_int("MEMORY_SUMMARY_MAX_CHARS", 3000)
 MEMORY_RECENT_MAX_CHARS = env_int("MEMORY_RECENT_MAX_CHARS", 6000)
 MEMORY_PRIOR_MAX_CHARS = env_int("MEMORY_PRIOR_MAX_CHARS", 3000)
 MEMORY_PROMPT_MAX_TOKENS = env_int("MEMORY_PROMPT_MAX_TOKENS", 1500)
+MEMORY_VOICE_RETRIEVAL_TIMEOUT_SECONDS = env_float(
+    "MEMORY_VOICE_RETRIEVAL_TIMEOUT_SECONDS", 0.35
+)
 
 # Keep the DB schema provider-neutral by storing one fixed vector size.
 # Both Google gemini-embedding-001 and OpenAI text-embedding-3-small can be used

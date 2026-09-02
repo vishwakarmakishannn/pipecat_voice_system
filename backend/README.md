@@ -1,10 +1,9 @@
-# Pipecat RAG Backend
+# Pipecat Mswipe Voice Backend
 
-This is the backend for the Pipecat RAG voice agent.
+This is the backend for the Pipecat Mswipe voice agent.
 
 The independent, release-controlled Mswipe production knowledge system is
-documented in [MSWIPE_KNOWLEDGE.md](MSWIPE_KNOWLEDGE.md). It is disabled by
-default and does not reuse the per-user `rag_files`/`rag_chunks` corpus.
+documented in [MSWIPE_KNOWLEDGE.md](MSWIPE_KNOWLEDGE.md).
 
 ## Local llama.cpp LLM
 
@@ -72,9 +71,10 @@ VOICE_LLM_RETRY_RESERVE_SECONDS=0.35
 
 The selected Groq model is a deployment decision, not an application
 hardcoding. Before promoting a model, run the live planning-only capability
-gate below. It checks timeless answers, current-search selection, ambiguity,
-contextual correction queries, and simulated tool markup without executing any
-tool:
+gate below. It checks timeless answers, ambiguity, Mswipe knowledge selection,
+contextual Mswipe follow-ups, complaint selection,
+current-fact limitations when web search is disabled, and simulated tool markup
+without executing any tool:
 
 ```bash
 GROQ_EVALUATION_MODEL=openai/gpt-oss-20b \
@@ -94,9 +94,24 @@ The backend injects the current date and timezone once into each session's
 durable system instruction. Exact clock
 time, timezone conversion, and deadline questions use the always-available
 `get_current_datetime` tool so changing seconds do not invalidate prompt-cache
-prefixes. `tavily_search` is also advertised on every ordinary turn; both
-read-only tools use automatic semantic selection rather than phrase matching.
-The write-capable complaint tool remains scoped to its confirmation workflow.
+prefixes. `search_mswipe_knowledge` is advertised when
+`MSWIPE_KNOWLEDGE_ENABLED=true`. `tavily_search` is advertised only when
+`WEB_SEARCH_ENABLED=true`; the Mswipe deployment keeps it disabled. Tool
+descriptions and the complete conversation drive semantic selection rather
+than keyword routing. While a complaint draft is active, only the complaint
+state-machine tool is available and a validated confirmation is required.
+
+```dotenv
+MSWIPE_KNOWLEDGE_ENABLED=true
+WEB_SEARCH_ENABLED=false
+VOICE_TOOL_FILLER_ENABLED=true
+VOICE_TOOL_FILLER_DELAY_MS=0
+VOICE_TOOL_FILLER_TEXT="Let me look that up for you."
+```
+
+With the zero-millisecond delay, the configured filler is sent to the live
+transcript and TTS before each tool's in-progress event. Set
+`VOICE_TOOL_FILLER_ENABLED=false` to disable it without changing code.
 
 ## Voice 2.0 call lifecycle and context
 
@@ -126,7 +141,7 @@ uv run alembic upgrade head
 ```
 
 The dashboard is split into `/playground`, `/calls`, `/calls/:callId`,
-`/files`, and `/memories`. Historical call data is served by the owner-scoped
+`/memories`. Historical call data is served by the owner-scoped
 `/api/calls` list/detail/timeline/turn/client-event/recording/delete/restore
 endpoints. There is no conversation-resume API.
 
@@ -343,77 +358,39 @@ Both paths must be configured together and must point to existing files.
 Kokoro uses no API key. Restart the backend after changing any `KOKORO_*`
 model or runtime setting.
 
-## RAG ingestion worker
+## Mswipe knowledge worker
 
-Uploads and links are stored as durable `queued` database jobs. In local
-development, run the ingestion worker in a second terminal:
+The only document-knowledge path is the release-controlled Mswipe subsystem.
+Run its control-plane worker with:
 
 ```bash
-uv run rag_worker.py
+uv sync --extra knowledge-worker
+uv run knowledge_worker.py
 ```
 
-Install its parsing dependencies with `uv sync --extra rag-worker`. Docker
-Compose starts the separate `rag-worker` service automatically; the voice API
-image intentionally excludes Docling and browser-extraction dependencies.
+Docker Compose starts `knowledge-worker` automatically. Source registration,
+crawling, review, release publication, validation, search, and rollback are
+documented in [MSWIPE_KNOWLEDGE.md](MSWIPE_KNOWLEDGE.md).
 
-RAG ingestion uses a source-neutral structured document model. Web pages are
-converted into ordered heading, paragraph, list, table, and code blocks before
-token-aware chunking; static HTML and Trafilatura candidates are scored for
-visible-text, heading, numeric-anchor, structure, and duplicate-line coverage.
-PDFs use Docling's structured chunks. Each ready source records its extractor,
-pipeline version, quality score, and warnings, and the chunk inspector exposes
-those diagnostics.
+For the normal local workflow, run only PostgreSQL and the durable knowledge
+worker in Docker, then keep the backend and frontend in terminals for readable
+logs:
 
-Apply Alembic migrations before starting the v2 worker. The structured-RAG
-migration rebuilds existing lexical vectors with PostgreSQL's multilingual
-`simple` configuration and queues existing ready links for automatic v2
-re-ingestion. Relevant tuning variables are:
+```bash
+# Project root
+docker compose up -d db knowledge-worker
 
-```dotenv
-RAG_LINK_CHUNK_TOKENS=400
-RAG_LINK_CHUNK_OVERLAP_TOKENS=40
-RAG_LINK_MIN_QUALITY_SCORE=0.55
-RAG_DOCUMENT_CHUNK_TOKENS=400
-RAG_DOCUMENT_CONTEXT_RESERVE_TOKENS=64
-RAG_DOCUMENT_CHUNK_TOKENIZER=sentence-transformers/all-MiniLM-L6-v2
-RAG_CONTEXT_CHUNK_TOKENS=450
-RAG_MAX_CONTEXT_TOKENS=1600
-RAG_VOICE_CONTEXT_MAX_TOKENS=420
-RAG_VOICE_CONTEXT_CHUNK_TOKENS=240
-RAG_VOICE_CONTEXT_MAX_CHUNKS=2
-RAG_VOICE_RAG_SOFT_TIMEOUT_SECONDS=0.9
-RAG_VOICE_RAG_TIMEOUT_SECONDS=2.5
-RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS=4.2
-RAG_VECTOR_FUSION_TIMEOUT_SECONDS=0.7
-RAG_VECTOR_DB_GRACE_SECONDS=0.15
-RAG_FOLLOWUP_FOCUS_MAX_TURNS=4
-MEMORY_EMBEDDING_BATCH_SIZE=50
-MEMORY_EMBEDDING_RETRY_ATTEMPTS=3
+# Terminal 1
+cd backend
+uv run main.py
+
+# Terminal 2
+cd frontend
+npm run dev
 ```
 
-Live RAG uses a two-stage voice deadline. At 900 ms it records a soft-latency
-diagnostic and keeps working behind the spoken “Let me check that” filler. It
-cancels only at the 2.5-second hard deadline. Keep the global retrieval timeout
-above the hard RAG deadline so the processor retains its orchestration margin.
-Direct turns do not wait on either deadline.
-
-The vector fusion deadline remains the ordinary semantic-retrieval ceiling.
-The smaller database grace is used only when query embedding has already
-finished before that deadline, preventing nearly completed PostgreSQL vector
-queries from being cancelled while keeping the slow-embedding fallback bounded.
-Retrieval focus is separate from action authorization: it helps short file
-follow-ups recover their recent subject, but complaint tools may hydrate only
-from their existing immediate evidence window.
-
-For networks that require a relay, configure authenticated TURN REST
-credentials on the backend. The browser receives a user-scoped credential with
-a ten-minute default lifetime; these values must not use the `VITE_` prefix:
-
-```dotenv
-TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
-TURN_SHARED_SECRET=replace-with-the-secret-configured-on-coturn
-TURN_CREDENTIAL_TTL_SECONDS=600
-```
+Port `8080` belongs to the frontend only when the Compose `frontend` service is
+running. With `npm run dev`, use the Vite URL printed in the frontend terminal.
 
 ## Tests
 
