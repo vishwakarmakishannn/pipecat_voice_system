@@ -16,6 +16,7 @@ import { fetchWithAuth, API_BASE } from './utils/api';
 import { buildAudioConstraints, buildIceServers, localSpeechLevelThreshold, webRTCConnectTimeoutMs } from './utils/webrtc';
 import { collectWebRTCAudioStats, createSessionTelemetry, ensureBotAudioPlayback, monitorPeerConnection, monitorRemoteAudioTrack, publishSessionTelemetry, recordCaptureTrack, recordSelectedCandidatePair, withConnectionDeadline } from './utils/sessionTelemetry';
 import { addLatencySample } from './utils/liveLatency';
+import { isLiveErrorSeverity, normalizeDiagnosticSeverity } from './utils/liveDiagnostics';
 import './App.css';
 import { CallDetailPage, CallsPage } from './components/CallPages';
 import { MemoriesPage } from './components/ResourcePages';
@@ -630,10 +631,11 @@ function VoiceApp({ onResetClient }) {
           });
           return;
         }
+        const severity = normalizeDiagnosticSeverity(item.severity);
         setTranscripts((items) => capTranscriptItems([...items, {
           id: item.fingerprint || `event-${Date.now()}`,
-          role: 'Error',
-          text: JSON.stringify(item),
+          role: isLiveErrorSeverity(severity) ? 'Error' : 'Diagnostic',
+          text: JSON.stringify({ ...item, severity: severity || 'info' }),
           timestamp: new Date(item.created_at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
         }]));
         return;
